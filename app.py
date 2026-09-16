@@ -1,17 +1,20 @@
 import json
 import logging
 import os
+import secrets
 import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import wraps
 
 import mysql.connector
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.utils import secure_filename
 
 logging.basicConfig(
@@ -23,6 +26,24 @@ logger = logging.getLogger('subcont-import')
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', 1024)) * 1024 * 1024
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SECURE_COOKIE', 'false').lower() == 'true'
+app.permanent_session_lifetime = timedelta(hours=int(os.environ.get('SESSION_HOURS', 12)))
+
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_hex(32)
+app.secret_key = SECRET_KEY
+
+APP_USER = os.environ.get('APP_USER', 'admin')
+APP_PASSWORD = os.environ.get('APP_PASSWORD', '')
+API_TOKEN = os.environ.get('API_TOKEN', '')
+
+LOGIN_MAX_ATTEMPTS = int(os.environ.get('LOGIN_MAX_ATTEMPTS', 5))
+LOGIN_LOCK_SECONDS = int(os.environ.get('LOGIN_LOCK_SECONDS', 300))
+login_attempts = {}
+login_lock = threading.Lock()
 
 MYSQL_CONFIG = {
     'host': os.environ.get('MYSQL_HOST', 'localhost'),
@@ -172,6 +193,58 @@ TABLE_CONFIGS = [
 ]
 
 TOTAL_TABLES = len(TABLE_CONFIGS)
+
+
+def alamat_pemanggil():
+    diteruskan = request.headers.get('X-Forwarded-For', '')
+    if diteruskan:
+        return diteruskan.split(',')[0].strip()
+    return request.remote_addr or 'tidak diketahui'
+
+
+def sisa_kunci(alamat):
+    with login_lock:
+        catatan = login_attempts.get(alamat)
+        if not catatan:
+            return 0
+        jumlah, sampai = catatan
+        if jumlah < LOGIN_MAX_ATTEMPTS:
+            return 0
+        sisa = int(sampai - time.time())
+        if sisa <= 0:
+            login_attempts.pop(alamat, None)
+            return 0
+        return sisa
+
+
+def catat_gagal(alamat):
+    with login_lock:
+        jumlah = login_attempts.get(alamat, (0, 0))[0] + 1
+        login_attempts[alamat] = (jumlah, time.time() + LOGIN_LOCK_SECONDS)
+
+
+def bersihkan_gagal(alamat):
+    with login_lock:
+        login_attempts.pop(alamat, None)
+
+
+def kredensial_cocok(pengguna, sandi):
+    if not APP_PASSWORD:
+        return False
+    return secrets.compare_digest(pengguna, APP_USER) and secrets.compare_digest(sandi, APP_PASSWORD)
+
+
+def butuh_login(view):
+    @wraps(view)
+    def pembungkus(*args, **kwargs):
+        if API_TOKEN and secrets.compare_digest(request.headers.get('X-API-Token', ''), API_TOKEN):
+            return view(*args, **kwargs)
+        if session.get('masuk'):
+            return view(*args, **kwargs)
+        if request.path == '/':
+            return redirect(url_for('login_page'))
+        return jsonify({'success': False, 'message': 'Belum login'}), 401
+    return pembungkus
 
 
 def connect():
@@ -474,12 +547,59 @@ def start_job(file_path, file_name, temp_dir):
     return job_id
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    alamat = alamat_pemanggil()
+
+    if not APP_PASSWORD:
+        return render_template('login.html', pesan='APP_PASSWORD belum diatur di server. Hubungi tim IT.'), 503
+
+    if request.method == 'POST':
+        terkunci = sisa_kunci(alamat)
+        if terkunci:
+            logger.warning('login diblokir sementara untuk %s, sisa %s detik', alamat, terkunci)
+            return render_template(
+                'login.html',
+                pesan='Terlalu banyak percobaan gagal. Coba lagi dalam ' + str(terkunci) + ' detik.'
+            ), 429
+
+        pengguna = request.form.get('pengguna', '')
+        sandi = request.form.get('sandi', '')
+
+        if kredensial_cocok(pengguna, sandi):
+            bersihkan_gagal(alamat)
+            session.permanent = True
+            session['masuk'] = pengguna
+            logger.info('login berhasil: %s dari %s', pengguna, alamat)
+            return redirect(url_for('upload_page'))
+
+        catat_gagal(alamat)
+        logger.warning('login gagal untuk pengguna %s dari %s', pengguna, alamat)
+        return render_template('login.html', pesan='Nama pengguna atau kata sandi salah.'), 401
+
+    if session.get('masuk'):
+        return redirect(url_for('upload_page'))
+
+    return render_template('login.html', pesan=None)
+
+
+@app.route('/logout', methods=['GET'])
+def logout_page():
+    pengguna = session.get('masuk')
+    session.clear()
+    if pengguna:
+        logger.info('logout: %s', pengguna)
+    return redirect(url_for('login_page'))
+
+
 @app.route('/', methods=['GET'])
+@butuh_login
 def upload_page():
-    return render_template('index.html')
+    return render_template('index.html', pengguna=session.get('masuk'))
 
 
 @app.route('/import', methods=['POST'])
+@butuh_login
 def handle_import():
     if is_import_running():
         logger.warning('permintaan import ditolak, ada import yang sedang berjalan')
@@ -523,6 +643,7 @@ def handle_import():
 
 
 @app.route('/status/<job_id>', methods=['GET'])
+@butuh_login
 def job_status(job_id):
     try:
         job = fetch_job(job_id)
@@ -542,6 +663,7 @@ def job_status(job_id):
 
 
 @app.route('/jobs', methods=['GET'])
+@butuh_login
 def job_list():
     try:
         jobs = fetch_recent_jobs(int(request.args.get('limit', 10)))
@@ -562,6 +684,11 @@ def health_check():
         logger.error('health check gagal: %s', error)
         return jsonify({'status': 'degraded', 'database': str(error)}), 503
 
+
+if not APP_PASSWORD:
+    logger.error('APP_PASSWORD belum diatur, halaman tidak bisa diakses siapa pun')
+if not os.environ.get('SECRET_KEY'):
+    logger.warning('SECRET_KEY belum diatur, semua sesi login akan hangus setiap kali container restart')
 
 ensure_job_table()
 
