@@ -205,50 +205,107 @@ function tampilkanPilihan() {
   kirim.disabled = false;
 }
 
-kirim.addEventListener('click', () => {
+async function minta(alamat, data) {
+  const res = await fetch(alamat, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+
+  let hasil = {};
+  try { hasil = await res.json(); } catch (err) { hasil = {}; }
+
+  if (!res.ok || !hasil.success) {
+    throw new Error(hasil.message || ('Server menjawab kode ' + res.status));
+  }
+  return hasil;
+}
+
+function kirimBagian(uploadId, index, bagian, saatProgres) {
+  return new Promise((resolve, reject) => {
+    let sisaPercobaan = 3;
+
+    const coba = () => {
+      const data = new FormData();
+      data.append('upload_id', uploadId);
+      data.append('index', index);
+      data.append('chunk', bagian);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload/chunk');
+
+      const gagal = (pesan) => {
+        sisaPercobaan -= 1;
+        if (sisaPercobaan > 0) {
+          setTimeout(coba, 2000);
+          return;
+        }
+        reject(new Error('Bagian ' + (index + 1) + ' gagal terkirim setelah 3 percobaan. ' + pesan));
+      };
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) saatProgres(e.loaded);
+      });
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status === 200) {
+          resolve();
+        } else {
+          gagal('Server menjawab kode ' + xhr.status + '.');
+        }
+      });
+
+      xhr.addEventListener('error', () => gagal('Koneksi terputus.'));
+
+      xhr.send(data);
+    };
+
+    coba();
+  });
+}
+
+kirim.addEventListener('click', async () => {
   const f = berkas.files[0];
   if (!f) return;
 
   kirim.disabled = true;
-  kirim.textContent = 'Mengunggah...';
+  kirim.textContent = 'Menyiapkan...';
   bar.classList.remove('hidden');
+  isiBar.style.width = '0';
   kartuStatus.classList.add('hidden');
   tabelRingkasan.classList.add('hidden');
   catatan.classList.add('hidden');
 
-  const data = new FormData();
-  data.append('file', f);
+  try {
+    const awal = await minta('/upload/init', { file_name: f.name });
+    const ukuranBagian = awal.chunk_size;
+    const total = Math.ceil(f.size / ukuranBagian);
 
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/import');
-
-  xhr.upload.addEventListener('progress', (e) => {
-    if (e.lengthComputable) {
-      const persen = Math.round((e.loaded / e.total) * 100);
-      isiBar.style.width = persen + '%';
-      kirim.textContent = 'Mengunggah ' + persen + '%';
+    for (let i = 0; i < total; i++) {
+      const potongan = f.slice(i * ukuranBagian, Math.min((i + 1) * ukuranBagian, f.size));
+      await kirimBagian(awal.upload_id, i, potongan, (terkirimBagian) => {
+        const terkirim = i * ukuranBagian + terkirimBagian;
+        const persen = Math.min(100, Math.round((terkirim / f.size) * 100));
+        isiBar.style.width = persen + '%';
+        kirim.textContent = 'Mengunggah ' + persen + '% (bagian ' + (i + 1) + ' dari ' + total + ')';
+      });
     }
-  });
 
-  xhr.addEventListener('load', () => {
-    let hasil = {};
-    try { hasil = JSON.parse(xhr.responseText); } catch (err) { hasil = {}; }
+    isiBar.style.width = '100%';
+    kirim.textContent = 'Menggabungkan file...';
 
-    if (xhr.status === 202 && hasil.job_id) {
-      kirim.textContent = 'Import sedang berjalan';
-      pantau(hasil.job_id);
-    } else {
-      selesaikanTombol();
-      tampilStatus('bad', 'Gagal memulai import', hasil.message || ('Server menjawab kode ' + xhr.status));
-    }
-  });
+    const hasil = await minta('/upload/finish', {
+      upload_id: awal.upload_id,
+      file_name: f.name,
+      total: total
+    });
 
-  xhr.addEventListener('error', () => {
+    kirim.textContent = 'Import sedang berjalan';
+    pantau(hasil.job_id);
+  } catch (err) {
     selesaikanTombol();
-    tampilStatus('bad', 'Koneksi terputus', 'File gagal terkirim ke server. Coba ulangi.');
-  });
-
-  xhr.send(data);
+    tampilStatus('bad', 'Gagal mengunggah', err.message || 'Terjadi kesalahan saat mengirim file.');
+  }
 });
 
 function selesaikanTombol() {
