@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Masuk &middot; Import Data Produksi</title>
+<style>
+  :root {
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --ink: #1c2530;
+    --muted: #64748b;
+    --line: #e2e8f0;
+    --brand: #1d4ed8;
+    --bad: #b91c1c;
+    --bad-soft: #fef2f2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 16px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .kotak {
+    width: 100%;
+    max-width: 380px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 32px 28px;
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); font-size: 14px; margin: 0 0 24px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  input {
+    width: 100%;
+    padding: 11px 12px;
+    font: inherit;
+    color: var(--ink);
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 16px;
+  }
+  input:focus { outline: 2px solid var(--brand); outline-offset: -1px; border-color: var(--brand); }
+  button {
+    width: 100%;
+    padding: 12px;
+    font: inherit;
+    font-weight: 600;
+    color: #fff;
+    background: var(--brand);
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .galat {
+    padding: 11px 13px;
+    margin-bottom: 18px;
+    background: var(--bad-soft);
+    color: var(--bad);
+    border-radius: 8px;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+  <form class="kotak" method="post" action="/login">
+    <h1>Import Data Produksi</h1>
+    <p class="sub">Masuk untuk mengunggah file mingguan.</p>
+
+    {% if pesan %}
+    <div class="galat">{{ pesan }}</div>
+    {% endif %}
+
+    <label for="pengguna">Nama pengguna</label>
+    <input type="text" id="pengguna" name="pengguna" autocomplete="username" autofocus required>
+
+    <label for="sandi">Kata sandi</label>
+    <input type="password" id="sandi" name="sandi" autocomplete="current-password" required>
+
+    <button type="submit">Masuk</button>
+  </form>
+</body>
+</html>
