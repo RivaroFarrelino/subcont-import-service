@@ -774,6 +774,63 @@ def upload_finish():
     return jsonify({'success': True, 'job_id': job_id, 'status': 'queued'}), 202
 
 
+FPPP_KOLOM_KUNCI = ['position_number', 'position_name', 'opening']
+FPPP_KOLOM_ANGKA = [
+    'frame_qty', 'sash_qty', 'total_scan', 'cut_qty', 'cutting_qty',
+    'assembly_scan_qty', 'sealant_scan_qty', 'packing_scan_qty'
+]
+
+
+@app.route('/fppp', methods=['POST'])
+@butuh_login
+def fppp_lookup():
+    payload = request.get_json(silent=True) or {}
+    nomor = str(payload.get('fppp_number', '')).strip()
+    opening = str(payload.get('opening', '')).strip()
+
+    if not nomor:
+        return jsonify({'success': False, 'message': 'fppp_number wajib diisi'}), 400
+
+    kolom = FPPP_KOLOM_KUNCI + FPPP_KOLOM_ANGKA
+    sql = 'SELECT ' + ', '.join(kolom) + ' FROM report WHERE fppp_number = %s'
+    params = [nomor]
+
+    if opening:
+        sql += ' AND opening = %s'
+        params.append(opening)
+
+    try:
+        connection = connect()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(sql, params)
+        baris = cursor.fetchall()
+        cursor.close()
+        connection.close()
+    except Exception as error:
+        logger.error('lookup fppp %s gagal: %s', nomor, error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    totals = {}
+    for nama in FPPP_KOLOM_ANGKA:
+        jumlah = 0
+        for b in baris:
+            nilai = b.get(nama)
+            if nilai is not None:
+                jumlah += float(nilai)
+        totals[nama] = jumlah
+
+    logger.info('lookup fppp %s opening %s menemukan %s baris', nomor, opening or '-', len(baris))
+
+    return jsonify({
+        'success': True,
+        'fppp_number': nomor,
+        'opening': opening,
+        'found': len(baris),
+        'totals': totals,
+        'rows': baris
+    })
+
+
 @app.route('/status/<job_id>', methods=['GET'])
 @butuh_login
 def job_status(job_id):
