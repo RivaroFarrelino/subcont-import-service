@@ -11,7 +11,8 @@ from datetime import datetime
 
 import mysql.connector
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
+from werkzeug.utils import secure_filename
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger('subcont-import')
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', 1024)) * 1024 * 1024
 
 MYSQL_CONFIG = {
     'host': os.environ.get('MYSQL_HOST', 'localhost'),
@@ -32,6 +34,7 @@ MYSQL_CONFIG = {
 }
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2000))
+UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/files')
 IMPORT_LOCK_NAME = 'subcont_import'
 
 JOB_TABLE_DDL = (
@@ -46,7 +49,7 @@ JOB_TABLE_DDL = (
     'started_at DATETIME NULL, '
     'finished_at DATETIME NULL, '
     'PRIMARY KEY (job_id), '
-    'KEY idx_status (status)'
+    'KEY idx_started (started_at)'
     ') ENGINE=InnoDB'
 )
 
@@ -164,6 +167,8 @@ TABLE_CONFIGS = [
     }
 ]
 
+TOTAL_TABLES = len(TABLE_CONFIGS)
+
 
 def connect():
     return mysql.connector.connect(**MYSQL_CONFIG)
@@ -180,6 +185,20 @@ def ensure_job_table():
         logger.info('tabel import_jobs siap')
     except Exception as error:
         logger.error('gagal menyiapkan tabel import_jobs: %s', error)
+
+
+def resolve_upload_dir():
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        probe = os.path.join(UPLOAD_DIR, '.tulis_tes')
+        with open(probe, 'w') as handle:
+            handle.write('ok')
+        os.remove(probe)
+        return UPLOAD_DIR
+    except Exception as error:
+        fallback = tempfile.gettempdir()
+        logger.warning('folder upload %s tidak bisa ditulis (%s), memakai %s', UPLOAD_DIR, error, fallback)
+        return fallback
 
 
 def create_job(job_id, file_name):
@@ -208,6 +227,30 @@ def update_job(job_id, **fields):
         connection.close()
     except Exception as error:
         logger.error('job %s gagal update status: %s', job_id, error)
+
+
+def fetch_job(job_id):
+    connection = connect()
+    cursor = connection.cursor(dictionary=True)
+    cursor.execute('SELECT * FROM import_jobs WHERE job_id = %s', (job_id,))
+    job = cursor.fetchone()
+    cursor.close()
+    connection.close()
+    return job
+
+
+def fetch_recent_jobs(limit):
+    connection = connect()
+    cursor = connection.cursor(dictionary=True)
+    cursor.execute(
+        'SELECT job_id, status, file_name, processed_rows, started_at, finished_at '
+        'FROM import_jobs ORDER BY started_at DESC LIMIT %s',
+        (limit,)
+    )
+    jobs = cursor.fetchall()
+    cursor.close()
+    connection.close()
+    return jobs
 
 
 def is_import_running():
@@ -304,9 +347,9 @@ def run_import(job_id, file_path):
         excel_file = pd.ExcelFile(file_path)
         logger.info('job %s sheet terdeteksi: %s', job_id, excel_file.sheet_names)
 
-        for config in TABLE_CONFIGS:
+        for index, config in enumerate(TABLE_CONFIGS, start=1):
             table = config['table']
-            update_job(job_id, current_table=table)
+            update_job(job_id, current_table=table + ' (' + str(index) + '/' + str(TOTAL_TABLES) + ')')
             table_rows = 0
 
             for source in config['sources']:
@@ -342,6 +385,7 @@ def run_import(job_id, file_path):
             status='failed',
             error_message=str(error),
             summary=json.dumps(summary),
+            current_table=None,
             finished_at=datetime.now()
         )
     finally:
@@ -361,45 +405,58 @@ def import_worker(job_id, file_path, temp_dir):
             logger.info('job %s file sementara dihapus', job_id)
 
 
+def start_job(file_path, file_name, temp_dir):
+    job_id = str(uuid.uuid4())
+    create_job(job_id, file_name)
+    thread = threading.Thread(target=import_worker, args=(job_id, file_path, temp_dir), daemon=True)
+    thread.start()
+    return job_id
+
+
+@app.route('/', methods=['GET'])
+def upload_page():
+    return render_template('index.html')
+
+
 @app.route('/import', methods=['POST'])
 def handle_import():
     if is_import_running():
         logger.warning('permintaan import ditolak, ada import yang sedang berjalan')
-        return jsonify({'success': False, 'message': 'Import lain sedang berjalan'}), 409
+        return jsonify({'success': False, 'message': 'Import lain sedang berjalan, tunggu sampai selesai'}), 409
 
-    job_id = str(uuid.uuid4())
     temp_dir = None
 
     if 'file' in request.files:
         uploaded_file = request.files['file']
-        temp_dir = tempfile.mkdtemp()
-        file_path = os.path.join(temp_dir, uploaded_file.filename)
+        if not uploaded_file.filename:
+            return jsonify({'success': False, 'message': 'File belum dipilih'}), 400
+
+        file_name = secure_filename(uploaded_file.filename)
+        if not file_name.lower().endswith(('.xlsx', '.xlsm')):
+            return jsonify({'success': False, 'message': 'File harus berformat .xlsx atau .xlsm'}), 400
+
+        target_dir = resolve_upload_dir()
+        file_path = os.path.join(target_dir, file_name)
         uploaded_file.save(file_path)
-        file_name = uploaded_file.filename
-        logger.info('job %s menerima upload %s', job_id, file_name)
+        logger.info('menerima upload %s ke %s', file_name, file_path)
     else:
         payload = request.get_json(silent=True) or {}
         file_path = payload.get('file_path')
         if not file_path:
             return jsonify({
                 'success': False,
-                'message': 'Kirim file lewat multipart field "file" atau kirim JSON {"file_path": "..."}'
+                'message': 'Kirim file lewat multipart field "file" atau JSON {"file_path": "..."}'
             }), 400
         if not os.path.exists(file_path):
             return jsonify({'success': False, 'message': 'File tidak ditemukan: ' + file_path}), 400
         file_name = os.path.basename(file_path)
-        logger.info('job %s memakai file yang sudah ada %s', job_id, file_path)
+        logger.info('memakai file yang sudah ada %s', file_path)
 
     try:
-        create_job(job_id, file_name)
+        job_id = start_job(file_path, file_name, temp_dir)
     except Exception as error:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.error('job %s gagal dibuat: %s', job_id, error)
+        logger.error('gagal memulai job: %s', error)
         return jsonify({'success': False, 'message': str(error)}), 500
-
-    thread = threading.Thread(target=import_worker, args=(job_id, file_path, temp_dir), daemon=True)
-    thread.start()
 
     return jsonify({'success': True, 'job_id': job_id, 'status': 'queued'}), 202
 
@@ -407,12 +464,7 @@ def handle_import():
 @app.route('/status/<job_id>', methods=['GET'])
 def job_status(job_id):
     try:
-        connection = connect()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute('SELECT * FROM import_jobs WHERE job_id = %s', (job_id,))
-        job = cursor.fetchone()
-        cursor.close()
-        connection.close()
+        job = fetch_job(job_id)
     except Exception as error:
         logger.error('gagal membaca status job %s: %s', job_id, error)
         return jsonify({'success': False, 'message': str(error)}), 500
@@ -424,6 +476,17 @@ def job_status(job_id):
         job['summary'] = json.loads(job['summary'])
 
     return jsonify({'success': True, 'job': job})
+
+
+@app.route('/jobs', methods=['GET'])
+def job_list():
+    try:
+        jobs = fetch_recent_jobs(int(request.args.get('limit', 10)))
+    except Exception as error:
+        logger.error('gagal membaca daftar job: %s', error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    return jsonify({'success': True, 'jobs': jobs})
 
 
 @app.route('/health', methods=['GET'])
