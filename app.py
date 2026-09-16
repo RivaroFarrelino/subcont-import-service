@@ -58,6 +58,8 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2000))
 NUMERIC_TYPES = {'int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double', 'numeric'}
 DATE_TYPES = {'date', 'datetime', 'timestamp'}
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/files')
+CHUNK_MB = int(os.environ.get('CHUNK_MB', 40))
+CHUNK_MAX_AGE_HOURS = int(os.environ.get('CHUNK_MAX_AGE_HOURS', 6))
 IMPORT_LOCK_NAME = 'subcont_import'
 
 JOB_TABLE_DDL = (
@@ -282,6 +284,41 @@ def resolve_upload_dir():
         fallback = tempfile.gettempdir()
         logger.warning('folder upload %s tidak bisa ditulis (%s), memakai %s', UPLOAD_DIR, error, fallback)
         return fallback
+
+
+def chunk_root():
+    return os.path.join(resolve_upload_dir(), '.bagian')
+
+
+def chunk_path(upload_id):
+    return os.path.join(chunk_root(), upload_id)
+
+
+def id_sah(nilai):
+    try:
+        uuid.UUID(str(nilai))
+        return True
+    except Exception:
+        return False
+
+
+def nama_excel_sah(nama):
+    return bool(nama) and nama.lower().endswith(('.xlsx', '.xlsm'))
+
+
+def bersihkan_bagian_lama():
+    akar = chunk_root()
+    if not os.path.isdir(akar):
+        return
+    batas = time.time() - CHUNK_MAX_AGE_HOURS * 3600
+    for nama in os.listdir(akar):
+        jalur = os.path.join(akar, nama)
+        try:
+            if os.path.isdir(jalur) and os.path.getmtime(jalur) < batas:
+                shutil.rmtree(jalur, ignore_errors=True)
+                logger.info('sisa unggah lama dihapus: %s', nama)
+        except Exception as error:
+            logger.warning('gagal membersihkan sisa unggah %s: %s', nama, error)
 
 
 def create_job(job_id, file_name):
@@ -637,6 +674,101 @@ def handle_import():
         job_id = start_job(file_path, file_name, temp_dir)
     except Exception as error:
         logger.error('gagal memulai job: %s', error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    return jsonify({'success': True, 'job_id': job_id, 'status': 'queued'}), 202
+
+
+@app.route('/upload/init', methods=['POST'])
+@butuh_login
+def upload_init():
+    if is_import_running():
+        return jsonify({'success': False, 'message': 'Import lain sedang berjalan, tunggu sampai selesai'}), 409
+
+    payload = request.get_json(silent=True) or {}
+    nama = secure_filename(payload.get('file_name', ''))
+
+    if not nama_excel_sah(nama):
+        return jsonify({'success': False, 'message': 'File harus berformat .xlsx atau .xlsm'}), 400
+
+    bersihkan_bagian_lama()
+    upload_id = str(uuid.uuid4())
+
+    try:
+        os.makedirs(chunk_path(upload_id), exist_ok=True)
+    except Exception as error:
+        logger.error('gagal menyiapkan folder unggah: %s', error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    logger.info('unggah %s dimulai untuk %s', upload_id, nama)
+    return jsonify({'success': True, 'upload_id': upload_id, 'chunk_size': CHUNK_MB * 1024 * 1024})
+
+
+@app.route('/upload/chunk', methods=['POST'])
+@butuh_login
+def upload_chunk():
+    upload_id = request.form.get('upload_id', '')
+    index = request.form.get('index', '')
+
+    if not id_sah(upload_id) or not index.isdigit():
+        return jsonify({'success': False, 'message': 'Permintaan tidak sah'}), 400
+
+    folder = chunk_path(upload_id)
+    if not os.path.isdir(folder):
+        return jsonify({'success': False, 'message': 'Sesi unggah tidak ditemukan atau sudah kedaluwarsa'}), 404
+
+    bagian = request.files.get('chunk')
+    if bagian is None:
+        return jsonify({'success': False, 'message': 'Potongan file tidak ditemukan'}), 400
+
+    bagian.save(os.path.join(folder, index.zfill(6)))
+    return jsonify({'success': True, 'index': int(index)})
+
+
+@app.route('/upload/finish', methods=['POST'])
+@butuh_login
+def upload_finish():
+    if is_import_running():
+        return jsonify({'success': False, 'message': 'Import lain sedang berjalan, tunggu sampai selesai'}), 409
+
+    payload = request.get_json(silent=True) or {}
+    upload_id = payload.get('upload_id', '')
+    nama = secure_filename(payload.get('file_name', ''))
+    total = payload.get('total', 0)
+
+    if not id_sah(upload_id) or not nama_excel_sah(nama) or not isinstance(total, int) or total < 1:
+        return jsonify({'success': False, 'message': 'Permintaan tidak sah'}), 400
+
+    folder = chunk_path(upload_id)
+    if not os.path.isdir(folder):
+        return jsonify({'success': False, 'message': 'Sesi unggah tidak ditemukan atau sudah kedaluwarsa'}), 404
+
+    hilang = [i for i in range(total) if not os.path.exists(os.path.join(folder, str(i).zfill(6)))]
+    if hilang:
+        logger.error('unggah %s tidak lengkap, potongan hilang: %s', upload_id, hilang[:10])
+        return jsonify({
+            'success': False,
+            'message': 'Unggahan tidak lengkap, ' + str(len(hilang)) + ' potongan hilang. Coba ulangi.'
+        }), 400
+
+    target = os.path.join(resolve_upload_dir(), nama)
+
+    try:
+        with open(target, 'wb') as keluaran:
+            for i in range(total):
+                with open(os.path.join(folder, str(i).zfill(6)), 'rb') as masukan:
+                    shutil.copyfileobj(masukan, keluaran, 1024 * 1024)
+        logger.info('unggah %s digabung jadi %s (%s potongan)', upload_id, target, total)
+    except Exception as error:
+        logger.error('gagal menggabung unggah %s: %s', upload_id, error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+    try:
+        job_id = start_job(target, nama, None)
+    except Exception as error:
+        logger.error('gagal memulai job setelah unggah %s: %s', upload_id, error)
         return jsonify({'success': False, 'message': str(error)}), 500
 
     return jsonify({'success': True, 'job_id': job_id, 'status': 'queued'}), 202
