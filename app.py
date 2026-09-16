@@ -80,6 +80,8 @@ JOB_TABLE_DDL = (
 
 JOB_TABLE_PATCH = 'ALTER TABLE import_jobs ADD COLUMN notes TEXT NULL'
 
+REPORT_INDEX_DDL = 'CREATE INDEX idx_report_fppp ON report (fppp_number)'
+
 TABLE_CONFIGS = [
     {
         'table': 'report',
@@ -271,6 +273,19 @@ def ensure_job_table():
         logger.info('tabel import_jobs siap')
     except Exception as error:
         logger.error('gagal menyiapkan tabel import_jobs: %s', error)
+
+
+def ensure_report_index():
+    try:
+        connection = connect()
+        cursor = connection.cursor()
+        cursor.execute(REPORT_INDEX_DDL)
+        connection.commit()
+        cursor.close()
+        connection.close()
+        logger.info('index idx_report_fppp dibuat')
+    except Exception as error:
+        logger.info('index idx_report_fppp dilewati: %s', error)
 
 
 def resolve_upload_dir():
@@ -794,11 +809,27 @@ def upload_finish():
     return jsonify({'success': True, 'job_id': job_id, 'status': 'queued'}), 202
 
 
-FPPP_KOLOM_KUNCI = ['position_number', 'position_name', 'opening']
 FPPP_KOLOM_ANGKA = [
     'frame_qty', 'sash_qty', 'total_scan', 'cut_qty', 'cutting_qty',
     'assembly_scan_qty', 'sealant_scan_qty', 'packing_scan_qty'
 ]
+FPPP_BAGIAN_DASAR = 5
+FPPP_BARIS_MAKS = 500
+
+
+def fppp_base(nomor):
+    bagian = str(nomor).split('/')
+    if len(bagian) <= FPPP_BAGIAN_DASAR:
+        return '/'.join(bagian)
+    return '/'.join(bagian[:FPPP_BAGIAN_DASAR])
+
+
+def fppp_lengkap(nomor):
+    return len(str(nomor).split('/')) > FPPP_BAGIAN_DASAR
+
+
+def escape_like(teks):
+    return teks.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
 @app.route('/fppp', methods=['POST'])
@@ -807,48 +838,111 @@ def fppp_lookup():
     payload = request.get_json(silent=True) or {}
     nomor = str(payload.get('fppp_number', '')).strip()
     opening = str(payload.get('opening', '')).strip()
+    sertakan_baris = bool(payload.get('include_rows'))
 
     if not nomor:
         return jsonify({'success': False, 'message': 'fppp_number wajib diisi'}), 400
 
-    kolom = FPPP_KOLOM_KUNCI + FPPP_KOLOM_ANGKA
-    sql = 'SELECT ' + ', '.join(kolom) + ' FROM report WHERE fppp_number = %s'
-    params = [nomor]
+    dasar = fppp_base(nomor)
+    eksak = fppp_lengkap(nomor)
+
+    agregat = ', '.join(['SUM(COALESCE(' + k + ', 0)) AS ' + k for k in FPPP_KOLOM_ANGKA])
+    identitas = (
+        "LEFT(GROUP_CONCAT(DISTINCT project_code ORDER BY project_code SEPARATOR ', '), 200) AS project_code, "
+        "LEFT(GROUP_CONCAT(DISTINCT customer_name ORDER BY customer_name SEPARATOR ', '), 200) AS customer_name"
+    )
+    sql = 'SELECT fppp_number, COUNT(*) AS found, ' + identitas + ', ' + agregat + ' FROM report WHERE '
+
+    if eksak:
+        sql += 'fppp_number = %s'
+        params = [nomor]
+    else:
+        sql += '(fppp_number = %s OR fppp_number LIKE %s)'
+        params = [dasar, escape_like(dasar) + '/%']
 
     if opening:
         sql += ' AND opening = %s'
         params.append(opening)
 
+    sql += ' GROUP BY fppp_number ORDER BY fppp_number'
+
     try:
         connection = connect()
         cursor = connection.cursor(dictionary=True)
         cursor.execute(sql, params)
-        baris = cursor.fetchall()
+        hasil = cursor.fetchall()
         cursor.close()
         connection.close()
     except Exception as error:
         logger.error('lookup fppp %s gagal: %s', nomor, error)
         return jsonify({'success': False, 'message': str(error)}), 500
 
-    totals = {}
-    for nama in FPPP_KOLOM_ANGKA:
-        jumlah = 0
-        for b in baris:
-            nilai = b.get(nama)
-            if nilai is not None:
-                jumlah += float(nilai)
-        totals[nama] = jumlah
+    variants = []
+    for row in hasil:
+        totals = {}
+        for k in FPPP_KOLOM_ANGKA:
+            nilai = row.get(k)
+            totals[k] = float(nilai) if nilai is not None else 0.0
+        variants.append({
+            'fppp_number': row['fppp_number'],
+            'found': int(row['found']),
+            'project_code': row.get('project_code') or '',
+            'customer_name': row.get('customer_name') or '',
+            'totals': totals
+        })
 
-    logger.info('lookup fppp %s opening %s menemukan %s baris', nomor, opening or '-', len(baris))
+    logger.info(
+        'lookup fppp input=%s dasar=%s eksak=%s opening=%s varian=%s',
+        nomor, dasar, eksak, opening or '-', len(variants)
+    )
 
-    return jsonify({
+    balasan = {
         'success': True,
-        'fppp_number': nomor,
+        'input': nomor,
+        'base': dasar,
         'opening': opening,
-        'found': len(baris),
-        'totals': totals,
-        'rows': baris
-    })
+        'exact_input': eksak,
+        'variant_count': len(variants),
+        'variants': variants,
+        'resolved': len(variants) == 1,
+        'ambiguous': len(variants) > 1,
+        'fppp_number': variants[0]['fppp_number'] if len(variants) == 1 else None,
+        'found': variants[0]['found'] if len(variants) == 1 else 0,
+        'totals': variants[0]['totals'] if len(variants) == 1 else None
+    }
+
+    if len(variants) > 1:
+        balasan['message'] = (
+            'Nomor FPPP ' + dasar + ' ada di ' + str(len(variants)) + ' proyek: '
+            + ' | '.join([
+                v['fppp_number'] + ' [' + v['project_code'] + ' - ' + v['customer_name'] + ']'
+                for v in variants
+            ])
+        )
+        logger.warning('lookup fppp ambigu: %s', balasan['message'])
+
+    if sertakan_baris and len(variants) == 1:
+        try:
+            connection = connect()
+            cursor = connection.cursor(dictionary=True)
+            sql_baris = (
+                'SELECT position_number, position_name, opening, '
+                + ', '.join(FPPP_KOLOM_ANGKA)
+                + ' FROM report WHERE fppp_number = %s'
+            )
+            params_baris = [variants[0]['fppp_number']]
+            if opening:
+                sql_baris += ' AND opening = %s'
+                params_baris.append(opening)
+            sql_baris += ' LIMIT ' + str(FPPP_BARIS_MAKS)
+            cursor.execute(sql_baris, params_baris)
+            balasan['rows'] = cursor.fetchall()
+            cursor.close()
+            connection.close()
+        except Exception as error:
+            logger.error('lookup fppp baris %s gagal: %s', nomor, error)
+
+    return jsonify(balasan)
 
 
 @app.route('/status/<job_id>', methods=['GET'])
@@ -900,6 +994,7 @@ if not os.environ.get('SECRET_KEY'):
     logger.warning('SECRET_KEY belum diatur, semua sesi login akan hangus setiap kali container restart')
 
 ensure_job_table()
+ensure_report_index()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
