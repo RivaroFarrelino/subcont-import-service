@@ -34,6 +34,8 @@ MYSQL_CONFIG = {
 }
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2000))
+NUMERIC_TYPES = {'int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double', 'numeric'}
+DATE_TYPES = {'date', 'datetime', 'timestamp'}
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/files')
 IMPORT_LOCK_NAME = 'subcont_import'
 
@@ -52,6 +54,8 @@ JOB_TABLE_DDL = (
     'KEY idx_started (started_at)'
     ') ENGINE=InnoDB'
 )
+
+JOB_TABLE_PATCH = 'ALTER TABLE import_jobs ADD COLUMN notes TEXT NULL'
 
 TABLE_CONFIGS = [
     {
@@ -180,6 +184,12 @@ def ensure_job_table():
         cursor = connection.cursor()
         cursor.execute(JOB_TABLE_DDL)
         connection.commit()
+        try:
+            cursor.execute(JOB_TABLE_PATCH)
+            connection.commit()
+            logger.info('kolom notes ditambahkan ke import_jobs')
+        except Exception:
+            pass
         cursor.close()
         connection.close()
         logger.info('tabel import_jobs siap')
@@ -267,6 +277,49 @@ def is_import_running():
         return False
 
 
+def fetch_column_types(table):
+    connection = connect()
+    cursor = connection.cursor()
+    cursor.execute(
+        'SELECT column_name, data_type FROM information_schema.columns '
+        'WHERE table_schema = %s AND table_name = %s',
+        (MYSQL_CONFIG['database'], table)
+    )
+    types = {row[0].lower(): row[1].lower() for row in cursor.fetchall()}
+    cursor.close()
+    connection.close()
+    return types
+
+
+def coerce_types(dataframe, columns, column_types, table, notes):
+    for column in columns:
+        kind = column_types.get(column.lower())
+        if kind in NUMERIC_TYPES:
+            converted = pd.to_numeric(dataframe[column], errors='coerce')
+        elif kind in DATE_TYPES:
+            converted = pd.to_datetime(dataframe[column], errors='coerce')
+        else:
+            continue
+        rusak = int((converted.isna() & dataframe[column].notna()).sum())
+        if rusak:
+            pesan = table + '.' + column + ': ' + str(rusak) + ' nilai tidak valid, dikosongkan'
+            notes.append(pesan)
+            logger.warning(pesan)
+        dataframe[column] = converted
+    return dataframe
+
+
+def drop_invalid_keys(dataframe, key_columns, table, notes):
+    before = len(dataframe)
+    dataframe = dataframe.dropna(subset=key_columns)
+    dibuang = before - len(dataframe)
+    if dibuang:
+        pesan = table + ': ' + str(dibuang) + ' baris dilewati karena kolom kunci kosong'
+        notes.append(pesan)
+        logger.warning(pesan)
+    return dataframe
+
+
 def clean_value(value):
     if pd.isna(value):
         return None
@@ -298,8 +351,9 @@ def build_upsert_sql(table, columns):
     )
 
 
-def upsert_dataframe(cursor, table, columns, key_columns, dataframe):
-    dataframe = dataframe.dropna(how='all', subset=key_columns)
+def upsert_dataframe(cursor, table, columns, key_columns, dataframe, column_types, notes):
+    dataframe = coerce_types(dataframe, columns, column_types, table, notes)
+    dataframe = drop_invalid_keys(dataframe, key_columns, table, notes)
     sql = build_upsert_sql(table, columns)
     batch = []
     processed = 0
@@ -338,6 +392,7 @@ def run_import(job_id, file_path):
         return
 
     summary = {}
+    notes = []
     total_processed = 0
 
     try:
@@ -350,13 +405,17 @@ def run_import(job_id, file_path):
         for index, config in enumerate(TABLE_CONFIGS, start=1):
             table = config['table']
             update_job(job_id, current_table=table + ' (' + str(index) + '/' + str(TOTAL_TABLES) + ')')
+            column_types = fetch_column_types(table)
             table_rows = 0
 
             for source in config['sources']:
                 dataframe = read_sheet(excel_file, source, config['columns'])
                 if dataframe is None:
                     continue
-                rows = upsert_dataframe(cursor, table, config['columns'], config['key_columns'], dataframe)
+                rows = upsert_dataframe(
+                    cursor, table, config['columns'], config['key_columns'],
+                    dataframe, column_types, notes
+                )
                 del dataframe
                 table_rows += rows
                 logger.info('job %s tabel %s sheet %s selesai %s baris', job_id, table, source['sheet'], rows)
@@ -372,6 +431,7 @@ def run_import(job_id, file_path):
             job_id,
             status='success',
             summary=json.dumps(summary),
+            notes=json.dumps(notes),
             processed_rows=total_processed,
             current_table=None,
             finished_at=datetime.now()
@@ -385,6 +445,7 @@ def run_import(job_id, file_path):
             status='failed',
             error_message=str(error),
             summary=json.dumps(summary),
+            notes=json.dumps(notes),
             current_table=None,
             finished_at=datetime.now()
         )
@@ -474,6 +535,8 @@ def job_status(job_id):
 
     if job.get('summary'):
         job['summary'] = json.loads(job['summary'])
+    if job.get('notes'):
+        job['notes'] = json.loads(job['notes'])
 
     return jsonify({'success': True, 'job': job})
 
