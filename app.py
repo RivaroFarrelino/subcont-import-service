@@ -84,7 +84,8 @@ TABLE_CONFIGS = [
     {
         'table': 'report',
         'sources': [
-            {'sheet': 'Report', 'header_row': 2, 'usecols': list(range(38))}
+            {'sheet': 'Report', 'header_row': 2, 'usecols': list(range(38))},
+            {'sheet': 'Monitoring', 'header_row': 2, 'usecols': list(range(38))}
         ],
         'columns': [
             'row_id', 'commission_number', 'position_number', 'piece_position', 'upload_date',
@@ -438,13 +439,26 @@ def clean_value(value):
     return value
 
 
+def cari_sheet(excel_file, nama):
+    if nama in excel_file.sheet_names:
+        return nama
+    target = str(nama).strip().lower()
+    for tersedia in excel_file.sheet_names:
+        if str(tersedia).strip().lower() == target:
+            return tersedia
+    return None
+
+
 def read_sheet(excel_file, source, columns):
-    if source['sheet'] not in excel_file.sheet_names:
+    nama = cari_sheet(excel_file, source['sheet'])
+    if nama is None:
         logger.warning('sheet tidak ada, dilewati: %s', source['sheet'])
         return None
+    if nama != source['sheet']:
+        logger.info('sheet %s dicocokkan ke %s', source['sheet'], nama)
     return pd.read_excel(
         excel_file,
-        sheet_name=source['sheet'],
+        sheet_name=nama,
         header=source['header_row'],
         usecols=source['usecols'],
         names=columns
@@ -535,6 +549,12 @@ def run_import(job_id, file_path):
             total_processed += table_rows
             update_job(job_id, processed_rows=total_processed)
             logger.info('job %s tabel %s commit, akumulasi %s baris', job_id, table, total_processed)
+
+            if table_rows == 0:
+                dicari = ', '.join([s['sheet'] for s in config['sources']])
+                pesan = table + ': tidak ada baris yang masuk, sheet yang dicari: ' + dicari
+                notes.append(pesan)
+                logger.warning('job %s %s', job_id, pesan)
 
         excel_file.close()
         update_job(
