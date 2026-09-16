@@ -117,6 +117,7 @@
       <thead><tr><th>Tabel</th><th class="num">Baris</th></tr></thead>
       <tbody id="isiRingkasan"></tbody>
     </table>
+    <div class="state warn hidden" id="catatan" style="margin-top:18px"></div>
   </div>
 
   <div class="card">
@@ -137,6 +138,7 @@ const kartuStatus = document.getElementById('kartuStatus');
 const status = document.getElementById('status');
 const tabelRingkasan = document.getElementById('tabelRingkasan');
 const isiRingkasan = document.getElementById('isiRingkasan');
+const catatan = document.getElementById('catatan');
 const riwayat = document.getElementById('riwayat');
 
 let timer = null;
@@ -202,6 +204,7 @@ kirim.addEventListener('click', () => {
   bar.classList.remove('hidden');
   kartuStatus.classList.add('hidden');
   tabelRingkasan.classList.add('hidden');
+  catatan.classList.add('hidden');
 
   const data = new FormData();
   data.append('file', f);
@@ -274,6 +277,11 @@ async function cek(jobId) {
     clearInterval(timer);
     selesaikanTombol();
     muatRiwayat();
+
+    if (job.notes && job.notes.length) {
+      catatan.innerHTML = '<b>Catatan data</b>' + job.notes.map((n) => '&middot; ' + n).join('<br>');
+      catatan.classList.remove('hidden');
+    }
 
     if (job.status === 'success') {
       tampilStatus('ok', 'Import selesai', angka(job.processed_rows) + ' baris berhasil diproses.');
