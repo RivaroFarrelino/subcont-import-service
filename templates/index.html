@@ -92,13 +92,21 @@
   .tag.run { background: var(--brand-soft); color: var(--brand); }
   .tag.warn { background: var(--warn-soft); color: var(--warn); }
   .empty { color: var(--muted); font-size: 14px; }
+  .kepala { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .keluar { color: var(--muted); font-size: 13px; text-decoration: none; white-space: nowrap; padding-top: 4px; }
+  .keluar:hover { color: var(--brand); text-decoration: underline; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <h1>Import Data Produksi</h1>
-  <p class="sub">Unggah file Excel mingguan dari gudang. Prosesnya berjalan otomatis setelah file terkirim.</p>
+  <div class="kepala">
+    <div>
+      <h1>Import Data Produksi</h1>
+      <p class="sub">Unggah file Excel mingguan dari gudang. Prosesnya berjalan otomatis setelah file terkirim.</p>
+    </div>
+    <a class="keluar" href="/logout">{{ pengguna }} &middot; Keluar</a>
+  </div>
 
   <div class="card" id="kartuUpload">
     <div class="drop" id="area">
