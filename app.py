@@ -54,6 +54,12 @@ MYSQL_CONFIG = {
     'connection_timeout': int(os.environ.get('MYSQL_CONNECT_TIMEOUT', 30))
 }
 
+HEALTH_MYSQL_CONFIG = dict(MYSQL_CONFIG)
+HEALTH_MYSQL_CONFIG['connection_timeout'] = int(os.environ.get('HEALTH_CONNECT_TIMEOUT', 3))
+HEALTH_CACHE_SECONDS = int(os.environ.get('HEALTH_CACHE_SECONDS', 15))
+health_state = {'waktu': 0.0, 'sehat': True}
+health_lock = threading.Lock()
+
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2000))
 NUMERIC_TYPES = {'int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double', 'numeric'}
 DATE_TYPES = {'date', 'datetime', 'timestamp'}
@@ -275,7 +281,7 @@ def ensure_job_table():
         logger.error('gagal menyiapkan tabel import_jobs: %s', error)
 
 
-def ensure_report_index():
+def bangun_report_index():
     try:
         connection = connect()
         cursor = connection.cursor()
@@ -283,9 +289,15 @@ def ensure_report_index():
         connection.commit()
         cursor.close()
         connection.close()
-        logger.info('index idx_report_fppp dibuat')
+        logger.info('index idx_report_fppp selesai dibuat')
     except Exception as error:
         logger.info('index idx_report_fppp dilewati: %s', error)
+
+
+def ensure_report_index():
+    thread = threading.Thread(target=bangun_report_index, daemon=True)
+    thread.start()
+    logger.info('pembuatan index idx_report_fppp dijalankan di latar belakang')
 
 
 def resolve_upload_dir():
@@ -977,15 +989,32 @@ def job_list():
     return jsonify({'success': True, 'jobs': jobs})
 
 
+def balasan_health(sehat):
+    if sehat:
+        return jsonify({'status': 'ok', 'database': 'connected'})
+    return jsonify({'status': 'degraded', 'database': 'tidak bisa dihubungi'}), 503
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
+    with health_lock:
+        if time.time() - health_state['waktu'] < HEALTH_CACHE_SECONDS:
+            return balasan_health(health_state['sehat'])
+
+    sehat = True
+
     try:
-        connection = connect()
+        connection = mysql.connector.connect(**HEALTH_MYSQL_CONFIG)
         connection.close()
-        return jsonify({'status': 'ok', 'database': 'connected'})
     except Exception as error:
+        sehat = False
         logger.error('health check gagal: %s', error)
-        return jsonify({'status': 'degraded', 'database': str(error)}), 503
+
+    with health_lock:
+        health_state['waktu'] = time.time()
+        health_state['sehat'] = sehat
+
+    return balasan_health(sehat)
 
 
 if not APP_PASSWORD:
