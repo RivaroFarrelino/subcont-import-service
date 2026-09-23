@@ -873,7 +873,7 @@ def fppp_lookup():
         params = [dasar, escape_like(dasar) + '/%']
 
     if opening:
-        sql += ' AND opening = %s'
+        sql += ' AND position_name = %s'
         params.append(opening)
 
     sql += ' GROUP BY fppp_number ORDER BY fppp_number'
@@ -904,7 +904,7 @@ def fppp_lookup():
         })
 
     logger.info(
-        'lookup fppp input=%s dasar=%s eksak=%s opening=%s varian=%s',
+        'lookup fppp input=%s dasar=%s eksak=%s position_name=%s varian=%s',
         nomor, dasar, eksak, opening or '-', len(variants)
     )
 
@@ -944,7 +944,7 @@ def fppp_lookup():
             )
             params_baris = [variants[0]['fppp_number']]
             if opening:
-                sql_baris += ' AND opening = %s'
+                sql_baris += ' AND position_name = %s'
                 params_baris.append(opening)
             sql_baris += ' LIMIT ' + str(FPPP_BARIS_MAKS)
             cursor.execute(sql_baris, params_baris)
