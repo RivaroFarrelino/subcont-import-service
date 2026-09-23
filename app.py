@@ -99,7 +99,7 @@ TABLE_CONFIGS = [
             'row_id', 'commission_number', 'position_number', 'piece_position', 'upload_date',
             'check_1', 'check_2', 'source_document', 'commission_number_dup', 'fppp_number',
             'customer_name', 'opening', 'position_name', 'color', 'unit_name', 'glass_type',
-            'frame_qty', 'sash_qty', 'total_scan', 'code', 'barcode', 'cut_qty', 'cutting_qty',
+            'frame_qty', 'daun_qty', 'total_scan', 'code', 'barcode', 'cut_qty', 'cutting_qty',
             'cutting_date_1', 'cutting_date_2', 'assembly_user', 'assembly_scan_qty', 'assembly_date',
             'sealant_user', 'sealant_scan_qty', 'sealant_date', 'packing_user', 'packing_standard_pack',
             'packing_scan_qty', 'project_code', 'billing_period', 'check_3', 'commission_number_ref'
@@ -822,7 +822,7 @@ def upload_finish():
 
 
 FPPP_KOLOM_ANGKA = [
-    'frame_qty', 'sash_qty', 'total_scan', 'cut_qty', 'cutting_qty',
+    'frame_qty', 'daun_qty', 'total_scan', 'cut_qty', 'cutting_qty',
     'assembly_scan_qty', 'sealant_scan_qty', 'packing_scan_qty'
 ]
 FPPP_BAGIAN_DASAR = 5
