@@ -873,7 +873,7 @@ def fppp_lookup():
         params = [dasar, escape_like(dasar) + '/%']
 
     if opening:
-        sql += ' AND position_name = %s'
+        sql += ' AND LOWER(TRIM(position_name)) = LOWER(%s)'
         params.append(opening)
 
     sql += ' GROUP BY fppp_number ORDER BY fppp_number'
@@ -944,7 +944,7 @@ def fppp_lookup():
             )
             params_baris = [variants[0]['fppp_number']]
             if opening:
-                sql_baris += ' AND position_name = %s'
+                sql_baris += ' AND LOWER(TRIM(position_name)) = LOWER(%s)'
                 params_baris.append(opening)
             sql_baris += ' LIMIT ' + str(FPPP_BARIS_MAKS)
             cursor.execute(sql_baris, params_baris)
