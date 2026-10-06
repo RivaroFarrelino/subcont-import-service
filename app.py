@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import mysql.connector
@@ -258,6 +258,13 @@ def butuh_login(view):
     return pembungkus
 
 
+WIB = timezone(timedelta(hours=7))
+
+
+def sekarang_wib():
+    return datetime.now(WIB).replace(tzinfo=None)
+
+
 def connect():
     return mysql.connector.connect(**MYSQL_CONFIG)
 
@@ -354,7 +361,7 @@ def create_job(job_id, file_name):
     cursor = connection.cursor()
     cursor.execute(
         'INSERT INTO import_jobs (job_id, status, file_name, started_at) VALUES (%s, %s, %s, %s)',
-        (job_id, 'queued', file_name, datetime.now())
+        (job_id, 'queued', file_name, sekarang_wib())
     )
     connection.commit()
     cursor.close()
@@ -538,7 +545,7 @@ def run_import(job_id, file_path):
             job_id,
             status='skipped',
             error_message='Import lain sedang berjalan',
-            finished_at=datetime.now()
+            finished_at=sekarang_wib()
         )
         return
 
@@ -591,7 +598,7 @@ def run_import(job_id, file_path):
             notes=json.dumps(notes),
             processed_rows=total_processed,
             current_table=None,
-            finished_at=datetime.now()
+            finished_at=sekarang_wib()
         )
         logger.info('job %s selesai, total %s baris', job_id, total_processed)
     except Exception as error:
@@ -604,7 +611,7 @@ def run_import(job_id, file_path):
             summary=json.dumps(summary),
             notes=json.dumps(notes),
             current_table=None,
-            finished_at=datetime.now()
+            finished_at=sekarang_wib()
         )
     finally:
         cursor.execute('SELECT RELEASE_LOCK(%s)', (IMPORT_LOCK_NAME,))
