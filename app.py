@@ -17,8 +17,6 @@ import pandas as pd
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.utils import secure_filename
 
-from inventory import iv_bp, siapkan_inventory
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -32,7 +30,6 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SECURE_COOKIE', 'false').lower() == 'true'
 app.permanent_session_lifetime = timedelta(hours=int(os.environ.get('SESSION_HOURS', 12)))
-app.register_blueprint(iv_bp)
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -90,6 +87,16 @@ JOB_TABLE_DDL = (
 JOB_TABLE_PATCH = 'ALTER TABLE import_jobs ADD COLUMN notes TEXT NULL'
 
 REPORT_INDEX_DDL = 'CREATE INDEX idx_report_fppp ON report (fppp_number)'
+REPORT_INDEX_KACA = 'idx_report_assembly_packing'
+MIGRASI_LOCK_NAME = 'subcont_migrasi_kolom'
+
+KOLOM_GANTI_NAMA = [
+    ('report', 'sealant_date', 'packing_date'),
+    ('report', 'assembly_date', 'sealant_date'),
+    ('report', 'cutting_date_2', 'assembly_date'),
+    ('report', 'cutting_date_1', 'cutting_date'),
+    ('data_awal', 'sash_qty', 'daun_qty')
+]
 
 TABLE_CONFIGS = [
     {
@@ -103,8 +110,8 @@ TABLE_CONFIGS = [
             'check_1', 'check_2', 'source_document', 'commission_number_dup', 'fppp_number',
             'customer_name', 'opening', 'position_name', 'color', 'unit_name', 'glass_type',
             'frame_qty', 'daun_qty', 'total_scan', 'code', 'barcode', 'cut_qty', 'cutting_qty',
-            'cutting_date_1', 'cutting_date_2', 'assembly_user', 'assembly_scan_qty', 'assembly_date',
-            'sealant_user', 'sealant_scan_qty', 'sealant_date', 'packing_user', 'packing_standard_pack',
+            'cutting_date', 'assembly_date', 'assembly_user', 'assembly_scan_qty', 'sealant_date',
+            'sealant_user', 'sealant_scan_qty', 'packing_date', 'packing_user', 'packing_standard_pack',
             'packing_scan_qty', 'project_code', 'billing_period', 'check_3', 'commission_number_ref'
         ],
         'key_columns': ['commission_number', 'position_number']
@@ -116,7 +123,7 @@ TABLE_CONFIGS = [
         ],
         'columns': [
             'project_code', 'fppp_ref', 'customer_name', 'commission_number', 'position_number',
-            'unit_code', 'upload_date', 'order_qty', 'frame_qty', 'sash_qty', 'check_value',
+            'unit_code', 'upload_date', 'order_qty', 'frame_qty', 'daun_qty', 'check_value',
             'check_2', 'check_3'
         ],
         'key_columns': ['commission_number', 'position_number']
@@ -291,23 +298,115 @@ def ensure_job_table():
         logger.error('gagal menyiapkan tabel import_jobs: %s', error)
 
 
+def info_kolom(cursor, table):
+    cursor.execute(
+        'SELECT column_name, column_type, is_nullable, data_type, character_maximum_length '
+        'FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = %s',
+        (table,)
+    )
+    return {str(baris[0]).lower(): baris for baris in cursor.fetchall()}
+
+
+def ganti_nama_kolom(cursor, table, lama, baru, kolom):
+    try:
+        cursor.execute('ALTER TABLE `' + table + '` RENAME COLUMN `' + lama + '` TO `' + baru + '`')
+    except mysql.connector.Error as error:
+        logger.info('RENAME COLUMN %s.%s tidak didukung (%s), memakai CHANGE', table, lama, error)
+        tipe = kolom[lama][1]
+        nullable = 'NULL' if kolom[lama][2] == 'YES' else 'NOT NULL'
+        cursor.execute('ALTER TABLE `' + table + '` CHANGE `' + lama + '` `' + baru + '` ' + tipe + ' ' + nullable)
+
+
+def migrasi_kolom():
+    connection = connect()
+    cursor = connection.cursor()
+    cursor.execute('SELECT GET_LOCK(%s, 60)', (MIGRASI_LOCK_NAME,))
+
+    if cursor.fetchone()[0] != 1:
+        cursor.close()
+        connection.close()
+        logger.warning('migrasi nama kolom dilewati, proses lain sedang memegang kunci')
+        return 0
+
+    diganti = 0
+
+    try:
+        for table, lama, baru in KOLOM_GANTI_NAMA:
+            kolom = info_kolom(cursor, table)
+
+            if lama in kolom and baru not in kolom:
+                ganti_nama_kolom(cursor, table, lama, baru, kolom)
+                connection.commit()
+                diganti += 1
+                logger.info('kolom %s.%s diganti jadi %s', table, lama, baru)
+
+        logger.info('migrasi nama kolom selesai, %s kolom diganti', diganti)
+        return diganti
+    finally:
+        cursor.execute('SELECT RELEASE_LOCK(%s)', (MIGRASI_LOCK_NAME,))
+        cursor.fetchone()
+        cursor.close()
+        connection.close()
+
+
+def ensure_migrasi_kolom():
+    try:
+        migrasi_kolom()
+    except Exception as error:
+        logger.error('migrasi nama kolom gagal: %s', error)
+
+
+def ddl_index_kaca(cursor):
+    kolom = info_kolom(cursor, 'report')
+    user = kolom.get('assembly_user')
+
+    if not user or 'packing_date' not in kolom:
+        return None
+
+    cursor.execute(
+        'SELECT COUNT(*) FROM information_schema.statistics '
+        'WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s',
+        ('report', REPORT_INDEX_KACA)
+    )
+
+    if cursor.fetchone()[0] > 0:
+        return None
+
+    panjang = user[4] or 0
+    prefix = '(50)' if user[3] in ('text', 'tinytext', 'mediumtext', 'longtext') or panjang > 255 else ''
+    return 'CREATE INDEX ' + REPORT_INDEX_KACA + ' ON report (assembly_user' + prefix + ', packing_date)'
+
+
 def bangun_report_index():
     try:
         connection = connect()
         cursor = connection.cursor()
-        cursor.execute(REPORT_INDEX_DDL)
-        connection.commit()
+        try:
+            cursor.execute(REPORT_INDEX_DDL)
+            connection.commit()
+            logger.info('index idx_report_fppp selesai dibuat')
+        except Exception as error:
+            logger.info('index idx_report_fppp dilewati: %s', error)
+        try:
+            ddl = ddl_index_kaca(cursor)
+            if ddl:
+                cursor.execute(ddl)
+                connection.commit()
+                logger.info('index %s selesai dibuat', REPORT_INDEX_KACA)
+            else:
+                logger.info('index %s sudah ada atau kolom belum siap', REPORT_INDEX_KACA)
+        except Exception as error:
+            logger.info('index %s dilewati: %s', REPORT_INDEX_KACA, error)
         cursor.close()
         connection.close()
-        logger.info('index idx_report_fppp selesai dibuat')
     except Exception as error:
-        logger.info('index idx_report_fppp dilewati: %s', error)
+        logger.info('pembuatan index report dilewati: %s', error)
 
 
 def ensure_report_index():
     thread = threading.Thread(target=bangun_report_index, daemon=True)
     thread.start()
-    logger.info('pembuatan index idx_report_fppp dijalankan di latar belakang')
+    logger.info('pembuatan index report dijalankan di latar belakang')
 
 
 def resolve_upload_dir():
@@ -557,6 +656,9 @@ def run_import(job_id, file_path):
     total_processed = 0
 
     try:
+        diganti = migrasi_kolom()
+        if diganti:
+            notes.append('migrasi nama kolom: ' + str(diganti) + ' kolom diganti')
         logger.info('job %s mulai, file %s', job_id, file_path)
         update_job(job_id, status='running')
 
@@ -1033,8 +1135,8 @@ if not os.environ.get('SECRET_KEY'):
     logger.warning('SECRET_KEY belum diatur, semua sesi login akan hangus setiap kali container restart')
 
 ensure_job_table()
+ensure_migrasi_kolom()
 ensure_report_index()
-siapkan_inventory()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
