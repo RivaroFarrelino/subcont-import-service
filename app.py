@@ -17,8 +17,6 @@ import pandas as pd
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.utils import secure_filename
 
-from inventory import iv_bp, siapkan_inventory
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -32,7 +30,6 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SECURE_COOKIE', 'false').lower() == 'true'
 app.permanent_session_lifetime = timedelta(hours=int(os.environ.get('SESSION_HOURS', 12)))
-app.register_blueprint(iv_bp)
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -1072,6 +1069,88 @@ def fppp_lookup():
     return jsonify(balasan)
 
 
+PACKING_MAKS_FPPP = 500
+PACKING_PER_QUERY = 100
+
+
+def teks_tanggal(nilai):
+    if nilai is None:
+        return None
+    if hasattr(nilai, 'isoformat'):
+        return nilai.isoformat()[:10]
+    teks = str(nilai).strip()
+    return teks[:10] if teks else None
+
+
+@app.route('/packing-status', methods=['POST'])
+@butuh_login
+def packing_status():
+    payload = request.get_json(silent=True) or {}
+    daftar = payload.get('fppp_numbers') or []
+
+    if not isinstance(daftar, list):
+        return jsonify({'success': False, 'message': 'fppp_numbers harus berupa list'}), 400
+
+    dasar = []
+    terlihat = set()
+    for nomor in daftar:
+        b = fppp_base(str(nomor).strip()).upper()
+        if b and b not in terlihat:
+            terlihat.add(b)
+            dasar.append(b)
+
+    if len(dasar) > PACKING_MAKS_FPPP:
+        return jsonify({'success': False, 'message': 'maksimal ' + str(PACKING_MAKS_FPPP) + ' FPPP sekali cek'}), 400
+
+    hasil = {b: {'baris': 0, 'dipacking': 0, 'pertama': None, 'terakhir': None} for b in dasar}
+
+    if not dasar:
+        return jsonify({'success': True, 'results': hasil})
+
+    mulai = time.time()
+
+    try:
+        connection = connect()
+        cursor = connection.cursor(dictionary=True)
+
+        for i in range(0, len(dasar), PACKING_PER_QUERY):
+            potong = dasar[i:i + PACKING_PER_QUERY]
+            kondisi = ' OR '.join(['fppp_number = %s OR fppp_number LIKE %s'] * len(potong))
+            params = []
+            for b in potong:
+                params.extend([b, escape_like(b) + '/%'])
+            cursor.execute(
+                'SELECT fppp_number, COUNT(*) AS baris, SUM(packing_date IS NOT NULL) AS dipacking, '
+                'MIN(packing_date) AS pertama, MAX(packing_date) AS terakhir '
+                'FROM report WHERE ' + kondisi + ' GROUP BY fppp_number',
+                params
+            )
+            for row in cursor.fetchall():
+                b = fppp_base(row['fppp_number']).upper()
+                if b not in hasil:
+                    continue
+                h = hasil[b]
+                h['baris'] += int(row['baris'] or 0)
+                h['dipacking'] += int(row['dipacking'] or 0)
+                pertama = teks_tanggal(row['pertama'])
+                terakhir = teks_tanggal(row['terakhir'])
+                if pertama and (h['pertama'] is None or pertama < h['pertama']):
+                    h['pertama'] = pertama
+                if terakhir and (h['terakhir'] is None or terakhir > h['terakhir']):
+                    h['terakhir'] = terakhir
+
+        cursor.close()
+        connection.close()
+    except Exception as error:
+        logger.error('cek packing %s FPPP gagal: %s', len(dasar), error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    sudah = sum(1 for h in hasil.values() if h['dipacking'] > 0)
+    logger.info('cek packing fppp=%s ada_data=%s sudah_packing=%s %.0fms', len(dasar), sum(1 for h in hasil.values() if h['baris'] > 0), sudah, (time.time() - mulai) * 1000)
+
+    return jsonify({'success': True, 'results': hasil})
+
+
 @app.route('/status/<job_id>', methods=['GET'])
 @butuh_login
 def job_status(job_id):
@@ -1140,7 +1219,6 @@ if not os.environ.get('SECRET_KEY'):
 ensure_job_table()
 ensure_migrasi_kolom()
 ensure_report_index()
-siapkan_inventory()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
