@@ -1115,10 +1115,8 @@ def packing_status():
 
         for i in range(0, len(dasar), PACKING_PER_QUERY):
             potong = dasar[i:i + PACKING_PER_QUERY]
-            kondisi = ' OR '.join(['fppp_number = %s OR fppp_number LIKE %s'] * len(potong))
-            params = []
-            for b in potong:
-                params.extend([b, escape_like(b) + '/%'])
+            kondisi = ' OR '.join(['fppp_number LIKE %s'] * len(potong))
+            params = [escape_like(b) + '%' for b in potong]
             cursor.execute(
                 'SELECT fppp_number, COUNT(*) AS baris, SUM(packing_date IS NOT NULL) AS dipacking, '
                 'MIN(packing_date) AS pertama, MAX(packing_date) AS terakhir '
@@ -1126,10 +1124,11 @@ def packing_status():
                 params
             )
             for row in cursor.fetchall():
-                b = fppp_base(row['fppp_number']).upper()
-                if b not in hasil:
+                nomor = str(row['fppp_number'] or '').strip().upper()
+                cocok = [b for b in potong if nomor.startswith(b)]
+                if not cocok:
                     continue
-                h = hasil[b]
+                h = hasil[max(cocok, key=len)]
                 h['baris'] += int(row['baris'] or 0)
                 h['dipacking'] += int(row['dipacking'] or 0)
                 pertama = teks_tanggal(row['pertama'])
