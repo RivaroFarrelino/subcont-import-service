@@ -18,6 +18,7 @@ from flask import Flask, jsonify, redirect, render_template, request, session, u
 from werkzeug.utils import secure_filename
 
 from inventory import iv_bp, siapkan_inventory
+from kurs import kurs_bp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SECURE_COOKIE', 'false').lower() == 'true'
 app.permanent_session_lifetime = timedelta(hours=int(os.environ.get('SESSION_HOURS', 12)))
 app.register_blueprint(iv_bp)
+app.register_blueprint(kurs_bp)
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
