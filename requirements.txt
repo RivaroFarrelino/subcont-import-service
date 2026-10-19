@@ -4,3 +4,4 @@ openpyxl
 mysql-connector-python
 gunicorn
 requests
+curl_cffi
