@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 import os
 import secrets
@@ -209,6 +211,11 @@ class KlienBC:
         )
         isi = respons.json()
         self.token = isi['access_token']
+        try:
+            klaim = json.loads(base64.urlsafe_b64decode(self.token.split('.')[1] + '=='))
+            logger.info('iv token BC aud=%s tid=%s appid=%s roles=%s', klaim.get('aud'), klaim.get('tid'), klaim.get('appid'), klaim.get('roles'))
+        except Exception:
+            pass
         self.kedaluwarsa = time.time() + int(isi.get('expires_in', 3600))
         logger.info('iv token BC diperbarui')
         return self.token
@@ -229,9 +236,11 @@ class KlienBC:
                 time.sleep(jeda)
                 continue
             if respons.status_code == 401 and pakai_token:
-                alasan = '401 token ditolak'
+                alasan = f'401 {respons.text[:500]}'
+                logger.warning('iv BC percobaan %s/%s 401 %s: %s', percobaan, BC_MAX_RETRY, url[:200], respons.text[:500])
+                if percobaan >= 2:
+                    raise GalatBC(f'BC menolak akses (401): {respons.text[:500]}')
                 self.token = None
-                logger.warning('iv BC percobaan %s/%s 401, token diulang', percobaan, BC_MAX_RETRY)
                 time.sleep(1)
                 continue
             if respons.status_code == 429 or respons.status_code >= 500:
