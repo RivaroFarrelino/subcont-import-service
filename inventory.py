@@ -53,24 +53,30 @@ NOL_QTY = Decimal('0.000001')
 NOL_NILAI = Decimal('0.005')
 
 DDL = [
-    'CREATE TABLE IF NOT EXISTS iv_daily ('
+    'CREATE TABLE IF NOT EXISTS iv_mutasi_bulanan ('
     'location_code VARCHAR(20) NOT NULL, '
-    'posting_date DATE NOT NULL, '
-    'item_no VARCHAR(30) NOT NULL, '
-    'arah TINYINT NOT NULL, '
-    'qty DECIMAL(24,5) NOT NULL, '
-    'nilai DECIMAL(24,4) NOT NULL, '
-    'entri INT NOT NULL, '
-    'PRIMARY KEY (location_code, posting_date, item_no, arah), '
-    'KEY idx_iv_daily_tanggal (posting_date)'
-    ') ENGINE=InnoDB',
-    'CREATE TABLE IF NOT EXISTS iv_closing ('
     'bulan DATE NOT NULL, '
+    'item_no VARCHAR(30) NOT NULL, '
+    'qty_masuk DECIMAL(24,5) NOT NULL, '
+    'nilai_masuk DECIMAL(24,4) NOT NULL, '
+    'qty_keluar DECIMAL(24,5) NOT NULL, '
+    'nilai_keluar DECIMAL(24,4) NOT NULL, '
+    'PRIMARY KEY (location_code, bulan, item_no), '
+    'KEY idx_iv_mutasi_bulan (bulan)'
+    ') ENGINE=InnoDB',
+    'CREATE TABLE IF NOT EXISTS iv_saldo_tahunan ('
+    'tahun SMALLINT NOT NULL, '
     'location_code VARCHAR(20) NOT NULL, '
     'item_no VARCHAR(30) NOT NULL, '
     'qty DECIMAL(24,5) NOT NULL, '
     'nilai DECIMAL(24,4) NOT NULL, '
-    'PRIMARY KEY (bulan, location_code, item_no)'
+    'PRIMARY KEY (tahun, location_code, item_no)'
+    ') ENGINE=InnoDB',
+    'CREATE TABLE IF NOT EXISTS iv_tahun_status ('
+    'tahun SMALLINT NOT NULL, '
+    'kotor TINYINT NOT NULL, '
+    'updated_at DATETIME NOT NULL, '
+    'PRIMARY KEY (tahun)'
     ') ENGINE=InnoDB',
     'CREATE TABLE IF NOT EXISTS iv_item ('
     'item_no VARCHAR(30) NOT NULL, '
@@ -104,6 +110,8 @@ DDL = [
     'KEY idx_iv_jobs_mulai (mulai)'
     ') ENGINE=InnoDB'
 ]
+
+TABEL_LAMA = ['iv_daily', 'iv_closing']
 
 
 class GalatBC(Exception):
@@ -147,17 +155,24 @@ def parse_bulan(teks):
         raise GalatInput('Format bulan harus YYYY-MM')
 
 
-def parse_tanggal(teks, nama):
-    try:
-        return datetime.strptime(str(teks).strip()[:10], '%Y-%m-%d').date()
-    except ValueError:
-        raise GalatInput(f'Tanggal {nama} tidak valid')
+def akhir_bulan(bulan):
+    return geser_bulan(bulan, 1) - timedelta(days=1)
 
 
 def siapkan_inventory():
     try:
         connection = connect()
         cursor = connection.cursor()
+        cursor.execute(
+            'SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name IN (%s, %s)',
+            tuple(TABEL_LAMA)
+        )
+        lama = [baris[0] for baris in cursor.fetchall()]
+        if lama:
+            for nama in lama:
+                cursor.execute(f'DROP TABLE IF EXISTS {nama}')
+            cursor.execute('DROP TABLE IF EXISTS iv_bulan')
+            logger.info('iv tabel format lama dihapus: %s, data perlu disinkron ulang', ', '.join(lama))
         for perintah in DDL:
             cursor.execute(perintah)
         connection.commit()
@@ -320,13 +335,13 @@ def sinkron_item(klien, connection):
 
 
 def agregasi_bulan(klien, bulan):
-    akhir = geser_bulan(bulan, 1) - timedelta(days=1)
     parameter = {
-        '$filter': f'Posting_Date ge {bulan.isoformat()} and Posting_Date le {akhir.isoformat()}',
-        '$select': 'Entry_No,Posting_Date,Location_Code,Item_No,Quantity,Cost_Amount_Actual,Cost_Amount_Expected'
+        '$filter': f'Posting_Date ge {bulan.isoformat()} and Posting_Date le {akhir_bulan(bulan).isoformat()}',
+        '$select': 'Entry_No,Location_Code,Item_No,Quantity,Cost_Amount_Actual,Cost_Amount_Expected'
     }
     hasil = {}
     entri = 0
+    nol = Decimal(0)
     for baris in klien.halaman(BC_ILE_ENDPOINT, parameter):
         for r in baris:
             lokasi = (r.get('Location_Code') or '').strip()
@@ -335,39 +350,41 @@ def agregasi_bulan(klien, bulan):
                 continue
             qty = Decimal(r.get('Quantity') or 0)
             nilai = Decimal(r.get('Cost_Amount_Actual') or 0) + Decimal(r.get('Cost_Amount_Expected') or 0)
-            if qty > 0:
-                arah = 1
-            elif qty < 0:
-                arah = -1
-            else:
-                arah = 1 if nilai >= 0 else -1
-            kunci = (lokasi[:20], r['Posting_Date'][:10], item[:30], arah)
+            kunci = (lokasi[:20], item[:30])
             catatan = hasil.get(kunci)
-            if catatan:
+            if catatan is None:
+                catatan = [nol, nol, nol, nol]
+                hasil[kunci] = catatan
+            if qty > 0 or (qty == 0 and nilai >= 0):
                 catatan[0] += qty
                 catatan[1] += nilai
-                catatan[2] += 1
             else:
-                hasil[kunci] = [qty, nilai, 1]
+                catatan[2] += qty
+                catatan[3] += nilai
             entri += 1
+        del baris
     return hasil, entri
 
 
 def simpan_bulan(connection, bulan, hasil, entri, job_id):
-    akhir = geser_bulan(bulan, 1) - timedelta(days=1)
     cursor = connection.cursor()
     try:
-        cursor.execute('DELETE FROM iv_daily WHERE posting_date BETWEEN %s AND %s', (bulan, akhir))
+        cursor.execute('DELETE FROM iv_mutasi_bulanan WHERE bulan = %s', (bulan,))
         sql = (
-            'INSERT INTO iv_daily (location_code, posting_date, item_no, arah, qty, nilai, entri) '
+            'INSERT INTO iv_mutasi_bulanan (location_code, bulan, item_no, qty_masuk, nilai_masuk, qty_keluar, nilai_keluar) '
             'VALUES (%s, %s, %s, %s, %s, %s, %s)'
         )
-        baris = [(k[0], k[1], k[2], k[3], v[0], v[1], v[2]) for k, v in hasil.items()]
+        baris = [(k[0], bulan, k[1], v[0], v[1], v[2], v[3]) for k, v in hasil.items() if not kosong(v)]
         for awal in range(0, len(baris), IV_INSERT_BATCH):
             cursor.executemany(sql, baris[awal:awal + IV_INSERT_BATCH])
         cursor.execute(
             'REPLACE INTO iv_bulan (bulan, entri, baris, job_id, synced_at) VALUES (%s, %s, %s, %s, %s)',
             (bulan, entri, len(baris), job_id, sekarang_wib())
+        )
+        cursor.execute(
+            'INSERT INTO iv_tahun_status (tahun, kotor, updated_at) VALUES (%s, 1, %s) '
+            'ON DUPLICATE KEY UPDATE kotor = 1, updated_at = VALUES(updated_at)',
+            (bulan.year, sekarang_wib())
         )
         connection.commit()
     except Exception:
@@ -378,30 +395,46 @@ def simpan_bulan(connection, bulan, hasil, entri, job_id):
     return len(baris)
 
 
-def hitung_closing(connection, bulan):
-    sebelum = geser_bulan(bulan, -1)
-    berikut = geser_bulan(bulan, 1)
+def bangun_saldo_tahunan(connection):
+    tahun_ini = sekarang_wib().year
     cursor = connection.cursor()
     try:
-        cursor.execute('DELETE FROM iv_closing WHERE bulan = %s', (bulan,))
-        cursor.execute(
-            'INSERT INTO iv_closing (bulan, location_code, item_no, qty, nilai) '
-            'SELECT %s, t.location_code, t.item_no, SUM(t.qty), SUM(t.nilai) FROM ('
-            'SELECT location_code, item_no, qty, nilai FROM iv_closing WHERE bulan = %s '
-            'UNION ALL '
-            'SELECT location_code, item_no, qty, nilai FROM iv_daily WHERE posting_date >= %s AND posting_date < %s'
-            ') t GROUP BY t.location_code, t.item_no '
-            'HAVING ABS(SUM(t.qty)) > 0.000001 OR ABS(SUM(t.nilai)) > 0.005',
-            (bulan, sebelum, bulan, berikut)
-        )
-        jumlah = cursor.rowcount
-        connection.commit()
+        cursor.execute('SELECT MIN(tahun) FROM iv_tahun_status WHERE kotor = 1 AND tahun < %s', (tahun_ini,))
+        awal = cursor.fetchone()[0]
+        if awal is None:
+            return 0
+        cursor.execute('SELECT MAX(tahun) FROM iv_tahun_status WHERE tahun < %s', (tahun_ini,))
+        akhir = cursor.fetchone()[0]
+        total = 0
+        for tahun in range(awal, akhir + 1):
+            mulai = time.time()
+            cursor.execute('DELETE FROM iv_saldo_tahunan WHERE tahun = %s', (tahun,))
+            cursor.execute(
+                'INSERT INTO iv_saldo_tahunan (tahun, location_code, item_no, qty, nilai) '
+                'SELECT %s, t.location_code, t.item_no, SUM(t.qty), SUM(t.nilai) FROM ('
+                'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan WHERE tahun = %s '
+                'UNION ALL '
+                'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar '
+                'FROM iv_mutasi_bulanan WHERE bulan >= %s AND bulan < %s'
+                ') t GROUP BY t.location_code, t.item_no '
+                'HAVING ABS(SUM(t.qty)) > 0.000001 OR ABS(SUM(t.nilai)) > 0.005',
+                (tahun, tahun - 1, date(tahun, 1, 1), date(tahun + 1, 1, 1))
+            )
+            jumlah = cursor.rowcount
+            cursor.execute(
+                'INSERT INTO iv_tahun_status (tahun, kotor, updated_at) VALUES (%s, 0, %s) '
+                'ON DUPLICATE KEY UPDATE kotor = 0, updated_at = VALUES(updated_at)',
+                (tahun, sekarang_wib())
+            )
+            connection.commit()
+            total += jumlah
+            logger.info('iv saldo akhir tahun %s dibangun: %s baris (%.1fs)', tahun, jumlah, time.time() - mulai)
+        return total
     except Exception:
         connection.rollback()
         raise
     finally:
         cursor.close()
-    return jumlah
 
 
 def bulan_tersinkron(connection):
@@ -454,13 +487,15 @@ def jalankan_sync(job_id, bulan_list):
             hasil, entri = agregasi_bulan(klien, bulan)
             connection.ping(reconnect=True, attempts=3, delay=5)
             baris = simpan_bulan(connection, bulan, hasil, entri, job_id)
-            closing = hitung_closing(connection, bulan)
+            del hasil
             total_entri += entri
             update_job(job_id, bulan_selesai=urutan, total_entri=total_entri)
             logger.info(
-                'iv job %s bulan %s selesai: %s entri, %s baris harian, %s closing (%.1fs)',
-                job_id, bulan, entri, baris, closing, time.time() - mulai
+                'iv job %s bulan %s selesai: %s entri ILE -> %s baris bulanan (%.1fs)',
+                job_id, bulan, entri, baris, time.time() - mulai
             )
+        connection.ping(reconnect=True, attempts=3, delay=5)
+        bangun_saldo_tahunan(connection)
         update_job(job_id, status='done', bulan_berjalan=None, selesai=sekarang_wib())
         logger.info('iv job %s selesai, total entri %s', job_id, total_entri)
     except Exception as error:
@@ -500,33 +535,49 @@ def validasi_lokasi(nilai):
 def baca_periode(parameter):
     mode = parameter.get('mode')
     if mode == 'asof':
-        tanggal = parse_tanggal(parameter.get('tanggal'), 'as of')
-        return mode, None, tanggal
+        bulan = parse_bulan(parameter.get('bulan'))
+        return mode, None, bulan
     if mode == 'range':
-        dari = parse_tanggal(parameter.get('dari'), 'awal')
-        sampai = parse_tanggal(parameter.get('sampai'), 'akhir')
+        dari = parse_bulan(parameter.get('dari'))
+        sampai = parse_bulan(parameter.get('sampai'))
         if dari > sampai:
-            raise GalatInput('Tanggal awal harus sebelum tanggal akhir')
+            raise GalatInput('Bulan awal harus sebelum bulan akhir')
         return mode, dari, sampai
     raise GalatInput('Mode periode tidak dikenal')
 
 
-def saldo_sebelum(cursor, lokasi, batas, per_item):
-    cursor.execute('SELECT MAX(bulan) FROM iv_bulan WHERE bulan < %s', (awal_bulan(batas),))
-    sebelum = cursor.fetchone()[0]
-    bulan = geser_bulan(sebelum, 1) if sebelum else date(1900, 1, 1)
-    sebelum = sebelum or date(1900, 1, 1)
+def snapshot_dipakai(cursor, tahun):
+    cursor.execute(
+        'SELECT '
+        '(SELECT COUNT(*) FROM iv_tahun_status WHERE tahun = %s AND kotor = 0), '
+        '(SELECT COUNT(*) FROM iv_tahun_status WHERE tahun <= %s AND kotor = 1)',
+        (tahun, tahun)
+    )
+    bersih, kotor = cursor.fetchone()
+    return bersih == 1 and kotor == 0
+
+
+def saldo_sebelum(cursor, lokasi, bulan, per_item):
     tanda = ', '.join(['%s'] * len(lokasi))
     kolom = 'location_code, item_no' if per_item else 'location_code'
-    cursor.execute(
-        f'SELECT {kolom}, SUM(qty), SUM(nilai) FROM ('
-        f'SELECT location_code, item_no, qty, nilai FROM iv_closing WHERE bulan = %s AND location_code IN ({tanda}) '
-        f'UNION ALL '
-        f'SELECT location_code, item_no, qty, nilai FROM iv_daily WHERE location_code IN ({tanda}) '
-        f'AND posting_date >= %s AND posting_date < %s'
-        f') t GROUP BY {kolom}',
-        (sebelum, *lokasi, *lokasi, bulan, batas)
-    )
+    if snapshot_dipakai(cursor, bulan.year - 1):
+        sql = (
+            f'SELECT {kolom}, SUM(qty), SUM(nilai) FROM ('
+            f'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan '
+            f'WHERE tahun = %s AND location_code IN ({tanda}) '
+            f'UNION ALL '
+            f'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar '
+            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan >= %s AND bulan < %s'
+            f') t GROUP BY {kolom}'
+        )
+        cursor.execute(sql, (bulan.year - 1, *lokasi, *lokasi, date(bulan.year, 1, 1), bulan))
+    else:
+        logger.info('iv saldo %s dihitung tanpa snapshot tahunan', bulan)
+        cursor.execute(
+            f'SELECT {kolom}, SUM(qty_masuk + qty_keluar), SUM(nilai_masuk + nilai_keluar) '
+            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s GROUP BY {kolom}',
+            (*lokasi, bulan)
+        )
     return cursor.fetchall()
 
 
@@ -534,9 +585,9 @@ def mutasi_periode(cursor, lokasi, dari, sampai, per_item):
     tanda = ', '.join(['%s'] * len(lokasi))
     kolom = 'location_code, item_no' if per_item else 'location_code'
     cursor.execute(
-        f'SELECT {kolom}, arah, SUM(qty), SUM(nilai) FROM iv_daily '
-        f'WHERE location_code IN ({tanda}) AND posting_date BETWEEN %s AND %s '
-        f'GROUP BY {kolom}, arah',
+        f'SELECT {kolom}, SUM(qty_masuk), SUM(nilai_masuk), SUM(qty_keluar), SUM(nilai_keluar) '
+        f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s '
+        f'GROUP BY {kolom}',
         (*lokasi, dari, sampai)
     )
     return cursor.fetchall()
@@ -566,9 +617,8 @@ def hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item):
         return baris
 
     if mode == 'asof':
-        for baris in saldo_sebelum(cursor, lokasi, sampai + timedelta(days=1), per_item):
-            kunci = baris[:-2]
-            catatan = ambil(kunci)
+        for baris in saldo_sebelum(cursor, lokasi, geser_bulan(sampai, 1), per_item):
+            catatan = ambil(baris[:-2])
             catatan[0] += baris[-2]
             catatan[1] += baris[-1]
     else:
@@ -577,10 +627,9 @@ def hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item):
             catatan[0] += baris[-2]
             catatan[1] += baris[-1]
         for baris in mutasi_periode(cursor, lokasi, dari, sampai, per_item):
-            catatan = ambil(baris[:-3])
-            posisi = 2 if baris[-3] == 1 else 4
-            catatan[posisi] += baris[-2]
-            catatan[posisi + 1] += baris[-1]
+            catatan = ambil(baris[:-4])
+            for posisi in range(4):
+                catatan[2 + posisi] += baris[-4 + posisi]
     hasil = {}
     for kunci, baris in data.items():
         if kosong(baris):
@@ -622,7 +671,9 @@ def respons_laporan(per_item):
             'success': True,
             'mode': mode,
             'dari': dari.isoformat() if dari else None,
-            'sampai': sampai.isoformat(),
+            'sampai': akhir_bulan(sampai).isoformat(),
+            'bulanDari': dari.isoformat()[:7] if dari else None,
+            'bulanSampai': sampai.isoformat()[:7],
             'lokasi': hasil,
             'sinkron': info_sinkron(cursor)
         }
