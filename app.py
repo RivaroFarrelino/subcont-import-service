@@ -1069,6 +1069,54 @@ def fppp_lookup():
     return jsonify(balasan)
 
 
+UNIT_MAKS_BARIS = 5000
+
+
+@app.route('/fppp-units', methods=['POST'])
+@butuh_login
+def fppp_units():
+    payload = request.get_json(silent=True) or {}
+    nomor = str(payload.get('fppp_number', '')).strip()
+
+    if not nomor:
+        return jsonify({'success': False, 'message': 'fppp_number wajib diisi'}), 400
+
+    dasar = fppp_base(nomor)
+    eksak = fppp_lengkap(nomor)
+    sql = (
+        'SELECT fppp_number, opening, position_name, COUNT(*) AS baris FROM report WHERE '
+        + ('fppp_number = %s' if eksak else '(fppp_number = %s OR fppp_number LIKE %s)')
+        + ' GROUP BY fppp_number, opening, position_name ORDER BY opening, position_name LIMIT ' + str(UNIT_MAKS_BARIS)
+    )
+    params = [nomor] if eksak else [dasar, escape_like(dasar) + '/%']
+    mulai = time.time()
+
+    try:
+        connection = connect()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(sql, params)
+        hasil = cursor.fetchall()
+        cursor.close()
+        connection.close()
+    except Exception as error:
+        logger.error('unit fppp %s gagal: %s', nomor, error)
+        return jsonify({'success': False, 'message': str(error)}), 500
+
+    varian = sorted(set(str(r['fppp_number'] or '') for r in hasil))
+    unik = {}
+    for r in hasil:
+        posisi = str(r['position_name'] or '').strip()
+        if not posisi:
+            continue
+        opening = str(r['opening'] or '').strip() or posisi.split('.')[0]
+        unik[(opening.upper(), posisi.upper())] = {'opening': opening, 'position_name': posisi}
+
+    units = sorted(unik.values(), key=lambda u: (u['opening'].upper(), u['position_name'].upper()))
+    logger.info('unit fppp input=%s dasar=%s varian=%s unit=%s %.0fms', nomor, dasar, len(varian), len(units), (time.time() - mulai) * 1000)
+
+    return jsonify({'success': True, 'input': nomor, 'base': dasar, 'variants': varian, 'units': units})
+
+
 PACKING_MAKS_FPPP = 500
 PACKING_PER_QUERY = 100
 
