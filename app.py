@@ -17,9 +17,6 @@ import pandas as pd
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.utils import secure_filename
 
-from inventory import iv_bp, siapkan_inventory
-from kurs import kurs_bp
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -33,8 +30,6 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('SECURE_COOKIE', 'false').lower() == 'true'
 app.permanent_session_lifetime = timedelta(hours=int(os.environ.get('SESSION_HOURS', 12)))
-app.register_blueprint(iv_bp)
-app.register_blueprint(kurs_bp)
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -69,7 +64,7 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2000))
 NUMERIC_TYPES = {'int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double', 'numeric'}
 DATE_TYPES = {'date', 'datetime', 'timestamp'}
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/files')
-CHUNK_MB = int(os.environ.get('CHUNK_MB', 40))
+CHUNK_MB = int(os.environ.get('CHUNK_MB', 4))
 CHUNK_MAX_AGE_HOURS = int(os.environ.get('CHUNK_MAX_AGE_HOURS', 6))
 IMPORT_LOCK_NAME = 'subcont_import'
 
@@ -1223,7 +1218,6 @@ if not os.environ.get('SECRET_KEY'):
 ensure_job_table()
 ensure_migrasi_kolom()
 ensure_report_index()
-siapkan_inventory()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
