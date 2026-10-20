@@ -221,11 +221,16 @@ async function minta(alamat, data) {
   return hasil;
 }
 
+const UKURAN_BAGIAN_MAKS = 4 * 1024 * 1024;
+const MAKS_PERCOBAAN = 6;
+const BATAS_WAKTU_BAGIAN = 120000;
+
 function kirimBagian(uploadId, index, bagian, saatProgres) {
   return new Promise((resolve, reject) => {
-    let sisaPercobaan = 3;
+    let percobaan = 0;
 
     const coba = () => {
+      percobaan += 1;
       const data = new FormData();
       data.append('upload_id', uploadId);
       data.append('index', index);
@@ -233,14 +238,16 @@ function kirimBagian(uploadId, index, bagian, saatProgres) {
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/upload/chunk');
+      xhr.timeout = BATAS_WAKTU_BAGIAN;
 
       const gagal = (pesan) => {
-        sisaPercobaan -= 1;
-        if (sisaPercobaan > 0) {
-          setTimeout(coba, 2000);
+        console.log('[UNGGAH] bagian', index + 1, 'gagal percobaan ke-' + percobaan + ':', pesan);
+        if (percobaan < MAKS_PERCOBAAN) {
+          saatProgres(0, 'mengulang bagian ' + (index + 1) + ' (percobaan ' + (percobaan + 1) + ')');
+          setTimeout(coba, Math.min(15000, 2000 * percobaan));
           return;
         }
-        reject(new Error('Bagian ' + (index + 1) + ' gagal terkirim setelah 3 percobaan. ' + pesan));
+        reject(new Error('Bagian ' + (index + 1) + ' gagal terkirim setelah ' + MAKS_PERCOBAAN + ' percobaan. ' + pesan + ' Cek koneksi internet lalu coba lagi.'));
       };
 
       xhr.upload.addEventListener('progress', (e) => {
@@ -250,18 +257,31 @@ function kirimBagian(uploadId, index, bagian, saatProgres) {
       xhr.addEventListener('load', () => {
         if (xhr.status === 200) {
           resolve();
+        } else if (xhr.status === 413) {
+          gagal('Potongan terlalu besar untuk server (413).');
+        } else if (xhr.status === 401) {
+          reject(new Error('Sesi login habis, silakan login ulang.'));
         } else {
           gagal('Server menjawab kode ' + xhr.status + '.');
         }
       });
 
       xhr.addEventListener('error', () => gagal('Koneksi terputus.'));
+      xhr.addEventListener('timeout', () => gagal('Bagian ini tidak selesai dalam ' + (BATAS_WAKTU_BAGIAN / 1000) + ' detik.'));
+      xhr.addEventListener('abort', () => gagal('Pengiriman dibatalkan.'));
 
       xhr.send(data);
     };
 
     coba();
   });
+}
+
+function teksDurasi(detik) {
+  if (!isFinite(detik) || detik < 0) return '-';
+  const m = Math.floor(detik / 60);
+  const s = Math.round(detik % 60);
+  return m > 0 ? m + ' mnt ' + s + ' dtk' : s + ' dtk';
 }
 
 kirim.addEventListener('click', async () => {
@@ -278,19 +298,28 @@ kirim.addEventListener('click', async () => {
 
   try {
     const awal = await minta('/upload/init', { file_name: f.name });
-    const ukuranBagian = awal.chunk_size;
+    const ukuranBagian = Math.min(awal.chunk_size || UKURAN_BAGIAN_MAKS, UKURAN_BAGIAN_MAKS);
     const total = Math.ceil(f.size / ukuranBagian);
+    const mulai = Date.now();
+
+    console.log('[UNGGAH] mulai', f.name, ukuran(f.size), total, 'bagian @', ukuran(ukuranBagian));
 
     for (let i = 0; i < total; i++) {
       const potongan = f.slice(i * ukuranBagian, Math.min((i + 1) * ukuranBagian, f.size));
-      await kirimBagian(awal.upload_id, i, potongan, (terkirimBagian) => {
+      await kirimBagian(awal.upload_id, i, potongan, (terkirimBagian, info) => {
         const terkirim = i * ukuranBagian + terkirimBagian;
         const persen = Math.min(100, Math.round((terkirim / f.size) * 100));
+        const detik = (Date.now() - mulai) / 1000;
+        const laju = detik > 0 ? terkirim / detik : 0;
+        const sisa = laju > 0 ? (f.size - terkirim) / laju : Infinity;
         isiBar.style.width = persen + '%';
-        kirim.textContent = 'Mengunggah ' + persen + '% (bagian ' + (i + 1) + ' dari ' + total + ')';
+        kirim.textContent = info
+          ? 'Koneksi tersendat, ' + info + '...'
+          : 'Mengunggah ' + persen + '% (bagian ' + (i + 1) + '/' + total + ') · ' + ukuran(laju) + '/dtk · sisa ' + teksDurasi(sisa);
       });
     }
 
+    console.log('[UNGGAH] semua bagian terkirim dalam', teksDurasi((Date.now() - mulai) / 1000));
     isiBar.style.width = '100%';
     kirim.textContent = 'Menggabungkan file...';
 
