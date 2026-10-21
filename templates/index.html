@@ -412,10 +412,10 @@ async function muatRiwayat() {
 
     riwayat.className = '';
     riwayat.innerHTML =
-      '<table><thead><tr><th>Waktu</th><th>File</th><th class="num">Baris</th><th>Status</th></tr></thead><tbody>' +
+      '<table><thead><tr><th>Waktu</th><th>File</th><th>Status</th></tr></thead><tbody>' +
       data.jobs.map((j) =>
         '<tr><td>' + waktu(j.started_at) + '</td><td>' + (j.file_name || '-') + '</td>' +
-        '<td class="num">' + angka(j.processed_rows) + '</td><td>' + label(j.status) + '</td></tr>'
+        '<td>' + label(j.status) + '</td></tr>'
       ).join('') +
       '</tbody></table>';
   } catch (err) {
