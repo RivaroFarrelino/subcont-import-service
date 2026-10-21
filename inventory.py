@@ -47,6 +47,7 @@ IV_REFRESH_MONTHS = int(os.environ.get('IV_REFRESH_MONTHS', 3))
 IV_INSERT_BATCH = int(os.environ.get('IV_INSERT_BATCH', 2000))
 IV_MAX_LOKASI = int(os.environ.get('IV_MAX_LOKASI', 300))
 IV_SYNC_LOCK = 'iv_sync'
+IV_ITEM_MUNDUR_HARI = int(os.environ.get('IV_ITEM_MUNDUR_HARI', 2))
 
 WIB = timezone(timedelta(hours=7))
 NOL_QTY = Decimal('0.000001')
@@ -320,8 +321,17 @@ def sinkron_item(klien, connection):
         'ON DUPLICATE KEY UPDATE description = VALUES(description), uom = VALUES(uom), updated_at = VALUES(updated_at)'
     )
     waktu = sekarang_wib()
+    cursor.execute('SELECT COUNT(*), MAX(updated_at) FROM iv_item')
+    jumlah, terakhir = cursor.fetchone()
+    parameter = {'$select': 'No,Description,Base_Unit_of_Measure'}
+    if jumlah and terakhir:
+        sejak = (terakhir - timedelta(days=IV_ITEM_MUNDUR_HARI)).date()
+        parameter['$filter'] = f'Last_Date_Modified ge {sejak.isoformat()}'
+        logger.info('iv item inkremental sejak %s (tersimpan %s)', sejak, jumlah)
+    else:
+        logger.info('iv item tarik penuh')
     total = 0
-    for baris in klien.halaman(BC_ITEM_ENDPOINT, {'$select': 'No,Description,Base_Unit_of_Measure'}):
+    for baris in klien.halaman(BC_ITEM_ENDPOINT, parameter):
         nilai = [
             (r['No'][:30], (r.get('Description') or '').strip()[:250], (r.get('Base_Unit_of_Measure') or '')[:20], waktu)
             for r in baris if r.get('No')
