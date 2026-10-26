@@ -48,6 +48,7 @@ IV_INSERT_BATCH = int(os.environ.get('IV_INSERT_BATCH', 2000))
 IV_MAX_LOKASI = int(os.environ.get('IV_MAX_LOKASI', 300))
 IV_SYNC_LOCK = 'iv_sync'
 IV_ITEM_MUNDUR_HARI = int(os.environ.get('IV_ITEM_MUNDUR_HARI', 2))
+IV_KECUALI_ITEM = [k.strip() for k in os.environ.get('IV_KECUALI_ITEM', 'SALES').split(',') if k.strip()]
 
 WIB = timezone(timedelta(hours=7))
 NOL_QTY = Decimal('0.000001')
@@ -556,6 +557,14 @@ def baca_periode(parameter):
     raise GalatInput('Mode periode tidak dikenal')
 
 
+def saring_item():
+    if not IV_KECUALI_ITEM:
+        return '', ()
+    bagian = ' AND '.join(['item_no NOT LIKE %s'] * len(IV_KECUALI_ITEM))
+    pola = tuple('%' + k.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%' for k in IV_KECUALI_ITEM)
+    return f' AND {bagian}', pola
+
+
 def snapshot_dipakai(cursor, tahun):
     cursor.execute(
         'SELECT '
@@ -570,23 +579,24 @@ def snapshot_dipakai(cursor, tahun):
 def saldo_sebelum(cursor, lokasi, bulan, per_item):
     tanda = ', '.join(['%s'] * len(lokasi))
     kolom = 'location_code, item_no' if per_item else 'location_code'
+    saring, pola = saring_item()
     if snapshot_dipakai(cursor, bulan.year - 1):
         sql = (
             f'SELECT {kolom}, SUM(qty), SUM(nilai) FROM ('
             f'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan '
-            f'WHERE tahun = %s AND location_code IN ({tanda}) '
+            f'WHERE tahun = %s AND location_code IN ({tanda}){saring} '
             f'UNION ALL '
             f'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar '
-            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan >= %s AND bulan < %s'
+            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan >= %s AND bulan < %s{saring}'
             f') t GROUP BY {kolom}'
         )
-        cursor.execute(sql, (bulan.year - 1, *lokasi, *lokasi, date(bulan.year, 1, 1), bulan))
+        cursor.execute(sql, (bulan.year - 1, *lokasi, *pola, *lokasi, date(bulan.year, 1, 1), bulan, *pola))
     else:
         logger.info('iv saldo %s dihitung tanpa snapshot tahunan', bulan)
         cursor.execute(
             f'SELECT {kolom}, SUM(qty_masuk + qty_keluar), SUM(nilai_masuk + nilai_keluar) '
-            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s GROUP BY {kolom}',
-            (*lokasi, bulan)
+            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s{saring} GROUP BY {kolom}',
+            (*lokasi, bulan, *pola)
         )
     return cursor.fetchall()
 
@@ -594,11 +604,12 @@ def saldo_sebelum(cursor, lokasi, bulan, per_item):
 def mutasi_periode(cursor, lokasi, dari, sampai, per_item):
     tanda = ', '.join(['%s'] * len(lokasi))
     kolom = 'location_code, item_no' if per_item else 'location_code'
+    saring, pola = saring_item()
     cursor.execute(
         f'SELECT {kolom}, SUM(qty_masuk), SUM(nilai_masuk), SUM(qty_keluar), SUM(nilai_keluar) '
-        f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s '
+        f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s{saring} '
         f'GROUP BY {kolom}',
-        (*lokasi, dari, sampai)
+        (*lokasi, dari, sampai, *pola)
     )
     return cursor.fetchall()
 
