@@ -47,6 +47,7 @@ IV_START_MONTH = os.environ.get('IV_START_MONTH', '2023-01')
 IV_REFRESH_MONTHS = int(os.environ.get('IV_REFRESH_MONTHS', 3))
 IV_INSERT_BATCH = int(os.environ.get('IV_INSERT_BATCH', 2000))
 IV_MAX_LOKASI = int(os.environ.get('IV_MAX_LOKASI', 300))
+IV_MAX_LOKASI_GRUP = int(os.environ.get('IV_MAX_LOKASI_GRUP', 2000))
 IV_ZIP_LEVEL = int(os.environ.get('IV_ZIP_LEVEL', 6))
 IV_SYNC_LOCK = 'iv_sync'
 IV_ITEM_MUNDUR_HARI = int(os.environ.get('IV_ITEM_MUNDUR_HARI', 2))
@@ -563,14 +564,14 @@ def sync_berjalan(cursor):
     return cursor.fetchone()[0] is not None
 
 
-def validasi_lokasi(nilai):
+def validasi_lokasi(nilai, batas=IV_MAX_LOKASI):
     if not isinstance(nilai, list) or not nilai:
         raise GalatInput('Pilih minimal satu lokasi')
     hasil = sorted({str(v).strip()[:20] for v in nilai if str(v).strip()})
     if not hasil:
         raise GalatInput('Pilih minimal satu lokasi')
-    if len(hasil) > IV_MAX_LOKASI:
-        raise GalatInput(f'Maksimal {IV_MAX_LOKASI} lokasi sekali tampil')
+    if len(hasil) > batas:
+        raise GalatInput(f'Maksimal {batas} lokasi sekali tampil')
     return hasil
 
 
@@ -726,7 +727,7 @@ def respons_laporan(tingkat):
     mulai = time.time()
     parameter = request.get_json(silent=True) or {}
     try:
-        lokasi = validasi_lokasi(parameter.get('lokasi'))
+        lokasi = validasi_lokasi(parameter.get('lokasi'), IV_MAX_LOKASI_GRUP if tingkat == TINGKAT_GRUP else IV_MAX_LOKASI)
         mode, dari, sampai = baca_periode(parameter)
     except GalatInput as error:
         return jsonify({'success': False, 'message': str(error)}), 400
