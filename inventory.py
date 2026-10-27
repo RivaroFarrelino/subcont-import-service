@@ -86,6 +86,7 @@ DDL = [
     'item_no VARCHAR(30) NOT NULL, '
     'description VARCHAR(250) NULL, '
     'uom VARCHAR(20) NULL, '
+    'posting_group VARCHAR(20) NULL, '
     'updated_at DATETIME NOT NULL, '
     'PRIMARY KEY (item_no)'
     ') ENGINE=InnoDB',
@@ -116,6 +117,14 @@ DDL = [
 ]
 
 TABEL_LAMA = ['iv_daily', 'iv_closing']
+
+KOLOM_BARU = [
+    ('iv_item', 'posting_group', 'VARCHAR(20) NULL AFTER uom')
+]
+
+TINGKAT_LOKASI = 'lokasi'
+TINGKAT_ITEM = 'item'
+TINGKAT_GRUP = 'grup'
 
 
 class GalatBC(Exception):
@@ -179,6 +188,14 @@ def siapkan_inventory():
             logger.info('iv tabel format lama dihapus: %s, data perlu disinkron ulang', ', '.join(lama))
         for perintah in DDL:
             cursor.execute(perintah)
+        for tabel, kolom, definisi in KOLOM_BARU:
+            cursor.execute(
+                'SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = %s AND column_name = %s',
+                (tabel, kolom)
+            )
+            if not cursor.fetchone()[0]:
+                cursor.execute(f'ALTER TABLE {tabel} ADD COLUMN {kolom} {definisi}')
+                logger.info('iv kolom %s.%s ditambahkan', tabel, kolom)
         connection.commit()
         cursor.close()
         connection.close()
@@ -320,29 +337,41 @@ def update_job(job_id, **kolom):
 def sinkron_item(klien, connection):
     cursor = connection.cursor()
     sql = (
-        'INSERT INTO iv_item (item_no, description, uom, updated_at) VALUES (%s, %s, %s, %s) '
-        'ON DUPLICATE KEY UPDATE description = VALUES(description), uom = VALUES(uom), updated_at = VALUES(updated_at)'
+        'INSERT INTO iv_item (item_no, description, uom, posting_group, updated_at) VALUES (%s, %s, %s, %s, %s) '
+        'ON DUPLICATE KEY UPDATE description = VALUES(description), uom = VALUES(uom), '
+        'posting_group = VALUES(posting_group), updated_at = VALUES(updated_at)'
     )
     waktu = sekarang_wib()
-    cursor.execute('SELECT COUNT(*), MAX(updated_at) FROM iv_item')
-    jumlah, terakhir = cursor.fetchone()
-    parameter = {'$select': 'No,Description,Base_Unit_of_Measure'}
-    if jumlah and terakhir:
+    cursor.execute('SELECT COUNT(*), MAX(updated_at), SUM(posting_group IS NULL) FROM iv_item')
+    jumlah, terakhir, tanpa_grup = cursor.fetchone()
+    parameter = {'$select': 'No,Description,Base_Unit_of_Measure,Inventory_Posting_Group'}
+    penuh = not (jumlah and terakhir) or bool(tanpa_grup)
+    if penuh:
+        logger.info('iv item tarik penuh (tersimpan %s, tanpa posting group %s)', jumlah, tanpa_grup)
+    else:
         sejak = (terakhir - timedelta(days=IV_ITEM_MUNDUR_HARI)).date()
         parameter['$filter'] = f'Last_Date_Modified ge {sejak.isoformat()}'
         logger.info('iv item inkremental sejak %s (tersimpan %s)', sejak, jumlah)
-    else:
-        logger.info('iv item tarik penuh')
     total = 0
     for baris in klien.halaman(BC_ITEM_ENDPOINT, parameter):
         nilai = [
-            (r['No'][:30], (r.get('Description') or '').strip()[:250], (r.get('Base_Unit_of_Measure') or '')[:20], waktu)
+            (
+                r['No'][:30],
+                (r.get('Description') or '').strip()[:250],
+                (r.get('Base_Unit_of_Measure') or '')[:20],
+                (r.get('Inventory_Posting_Group') or '').strip()[:20],
+                waktu
+            )
             for r in baris if r.get('No')
         ]
         for awal in range(0, len(nilai), IV_INSERT_BATCH):
             cursor.executemany(sql, nilai[awal:awal + IV_INSERT_BATCH])
         connection.commit()
         total += len(nilai)
+    if penuh:
+        cursor.execute("UPDATE iv_item SET posting_group = '' WHERE posting_group IS NULL")
+        connection.commit()
+        logger.info('iv item tidak ditemukan di BC ditandai tanpa posting group: %s', cursor.rowcount)
     cursor.close()
     logger.info('iv item tersinkron %s', total)
 
@@ -578,13 +607,26 @@ def snapshot_dipakai(cursor, tahun):
     return bersih == 1 and kotor == 0
 
 
-def saldo_sebelum(cursor, lokasi, bulan, per_item):
+def kolom_tingkat(tingkat):
+    return 'location_code' if tingkat == TINGKAT_LOKASI else 'location_code, item_no'
+
+
+def per_grup(sql, jumlah_nilai):
+    nilai = ', '.join(f'SUM(x.v{indeks})' for indeks in range(jumlah_nilai))
+    grup = "COALESCE(i.posting_group, '')"
+    return (
+        f'SELECT x.location_code, {grup}, {nilai} FROM ({sql}) x '
+        f'LEFT JOIN iv_item i ON i.item_no = x.item_no GROUP BY x.location_code, {grup}'
+    )
+
+
+def saldo_sebelum(cursor, lokasi, bulan, tingkat):
     tanda = ', '.join(['%s'] * len(lokasi))
-    kolom = 'location_code, item_no' if per_item else 'location_code'
+    kolom = kolom_tingkat(tingkat)
     saring, pola = saring_item()
     if snapshot_dipakai(cursor, bulan.year - 1):
         sql = (
-            f'SELECT {kolom}, SUM(qty), SUM(nilai) FROM ('
+            f'SELECT {kolom}, SUM(qty) AS v0, SUM(nilai) AS v1 FROM ('
             f'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan '
             f'WHERE tahun = %s AND location_code IN ({tanda}){saring} '
             f'UNION ALL '
@@ -592,27 +634,28 @@ def saldo_sebelum(cursor, lokasi, bulan, per_item):
             f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan >= %s AND bulan < %s{saring}'
             f') t GROUP BY {kolom}'
         )
-        cursor.execute(sql, (bulan.year - 1, *lokasi, *pola, *lokasi, date(bulan.year, 1, 1), bulan, *pola))
+        argumen = (bulan.year - 1, *lokasi, *pola, *lokasi, date(bulan.year, 1, 1), bulan, *pola)
     else:
         logger.info('iv saldo %s dihitung tanpa snapshot tahunan', bulan)
-        cursor.execute(
-            f'SELECT {kolom}, SUM(qty_masuk + qty_keluar), SUM(nilai_masuk + nilai_keluar) '
-            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s{saring} GROUP BY {kolom}',
-            (*lokasi, bulan, *pola)
+        sql = (
+            f'SELECT {kolom}, SUM(qty_masuk + qty_keluar) AS v0, SUM(nilai_masuk + nilai_keluar) AS v1 '
+            f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s{saring} GROUP BY {kolom}'
         )
+        argumen = (*lokasi, bulan, *pola)
+    cursor.execute(per_grup(sql, 2) if tingkat == TINGKAT_GRUP else sql, argumen)
     return cursor.fetchall()
 
 
-def mutasi_periode(cursor, lokasi, dari, sampai, per_item):
+def mutasi_periode(cursor, lokasi, dari, sampai, tingkat):
     tanda = ', '.join(['%s'] * len(lokasi))
-    kolom = 'location_code, item_no' if per_item else 'location_code'
+    kolom = kolom_tingkat(tingkat)
     saring, pola = saring_item()
-    cursor.execute(
-        f'SELECT {kolom}, SUM(qty_masuk), SUM(nilai_masuk), SUM(qty_keluar), SUM(nilai_keluar) '
+    sql = (
+        f'SELECT {kolom}, SUM(qty_masuk) AS v0, SUM(nilai_masuk) AS v1, SUM(qty_keluar) AS v2, SUM(nilai_keluar) AS v3 '
         f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s{saring} '
-        f'GROUP BY {kolom}',
-        (*lokasi, dari, sampai, *pola)
+        f'GROUP BY {kolom}'
     )
+    cursor.execute(per_grup(sql, 4) if tingkat == TINGKAT_GRUP else sql, (*lokasi, dari, sampai, *pola))
     return cursor.fetchall()
 
 
@@ -629,7 +672,7 @@ def kosong(baris):
     return True
 
 
-def hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item):
+def hitung_laporan(cursor, lokasi, mode, dari, sampai, tingkat):
     lebar = 2 if mode == 'asof' else 6
     data = {}
 
@@ -641,16 +684,16 @@ def hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item):
         return baris
 
     if mode == 'asof':
-        for baris in saldo_sebelum(cursor, lokasi, geser_bulan(sampai, 1), per_item):
+        for baris in saldo_sebelum(cursor, lokasi, geser_bulan(sampai, 1), tingkat):
             catatan = ambil(baris[:-2])
             catatan[0] += baris[-2]
             catatan[1] += baris[-1]
     else:
-        for baris in saldo_sebelum(cursor, lokasi, dari, per_item):
+        for baris in saldo_sebelum(cursor, lokasi, dari, tingkat):
             catatan = ambil(baris[:-2])
             catatan[0] += baris[-2]
             catatan[1] += baris[-1]
-        for baris in mutasi_periode(cursor, lokasi, dari, sampai, per_item):
+        for baris in mutasi_periode(cursor, lokasi, dari, sampai, tingkat):
             catatan = ambil(baris[:-4])
             for posisi in range(4):
                 catatan[2 + posisi] += baris[-4 + posisi]
@@ -659,11 +702,11 @@ def hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item):
         if kosong(baris):
             continue
         rapi = [angka(nilai, 5 if indeks % 2 == 0 else 2) for indeks, nilai in enumerate(baris)]
-        if per_item:
+        if tingkat != TINGKAT_LOKASI:
             hasil.setdefault(kunci[0], []).append([kunci[1], *rapi])
         else:
             hasil[kunci[0]] = rapi
-    if per_item:
+    if tingkat != TINGKAT_LOKASI:
         for daftar in hasil.values():
             daftar.sort(key=lambda r: r[0])
     return hasil
@@ -679,7 +722,7 @@ def info_sinkron(cursor):
     }
 
 
-def respons_laporan(per_item):
+def respons_laporan(tingkat):
     mulai = time.time()
     parameter = request.get_json(silent=True) or {}
     try:
@@ -690,7 +733,7 @@ def respons_laporan(per_item):
     connection = connect()
     cursor = connection.cursor()
     try:
-        hasil = hitung_laporan(cursor, lokasi, mode, dari, sampai, per_item)
+        hasil = hitung_laporan(cursor, lokasi, mode, dari, sampai, tingkat)
         isi = {
             'success': True,
             'mode': mode,
@@ -701,7 +744,7 @@ def respons_laporan(per_item):
             'lokasi': hasil,
             'sinkron': info_sinkron(cursor)
         }
-        if per_item:
+        if tingkat == TINGKAT_ITEM:
             kode = sorted({r[0] for daftar in hasil.values() for r in daftar})
             items = {}
             for awal in range(0, len(kode), 1000):
@@ -713,7 +756,7 @@ def respons_laporan(per_item):
                 for nomor, deskripsi, uom in cursor.fetchall():
                     items[nomor] = [deskripsi or '', uom or '']
             isi['items'] = items
-        jenis = 'mutasi' if per_item else 'summary'
+        jenis = {TINGKAT_ITEM: 'mutasi', TINGKAT_LOKASI: 'summary', TINGKAT_GRUP: 'posting'}[tingkat]
         if parameter.get('zip'):
             mentah = json.dumps(isi, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
             padat = base64.b64encode(gzip.compress(mentah, IV_ZIP_LEVEL)).decode('ascii')
@@ -738,13 +781,19 @@ def respons_laporan(per_item):
 @iv_bp.route('/mutasi', methods=['POST'])
 @butuh_token
 def iv_mutasi():
-    return respons_laporan(True)
+    return respons_laporan(TINGKAT_ITEM)
 
 
 @iv_bp.route('/summary', methods=['POST'])
 @butuh_token
 def iv_summary():
-    return respons_laporan(False)
+    return respons_laporan(TINGKAT_LOKASI)
+
+
+@iv_bp.route('/posting', methods=['POST'])
+@butuh_token
+def iv_posting():
+    return respons_laporan(TINGKAT_GRUP)
 
 
 @iv_bp.route('/sync', methods=['POST'])
