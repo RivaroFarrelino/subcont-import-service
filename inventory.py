@@ -1,4 +1,5 @@
 import base64
+import gzip
 import json
 import logging
 import os
@@ -46,6 +47,7 @@ IV_START_MONTH = os.environ.get('IV_START_MONTH', '2023-01')
 IV_REFRESH_MONTHS = int(os.environ.get('IV_REFRESH_MONTHS', 3))
 IV_INSERT_BATCH = int(os.environ.get('IV_INSERT_BATCH', 2000))
 IV_MAX_LOKASI = int(os.environ.get('IV_MAX_LOKASI', 300))
+IV_ZIP_LEVEL = int(os.environ.get('IV_ZIP_LEVEL', 6))
 IV_SYNC_LOCK = 'iv_sync'
 IV_ITEM_MUNDUR_HARI = int(os.environ.get('IV_ITEM_MUNDUR_HARI', 2))
 IV_KECUALI_ITEM = [k.strip() for k in os.environ.get('IV_KECUALI_ITEM', 'SALES').split(',') if k.strip()]
@@ -615,7 +617,8 @@ def mutasi_periode(cursor, lokasi, dari, sampai, per_item):
 
 
 def angka(nilai, digit):
-    return float(round(nilai, digit))
+    hasil = float(round(nilai, digit))
+    return int(hasil) if hasil.is_integer() else hasil
 
 
 def kosong(baris):
@@ -710,9 +713,18 @@ def respons_laporan(per_item):
                 for nomor, deskripsi, uom in cursor.fetchall():
                     items[nomor] = [deskripsi or '', uom or '']
             isi['items'] = items
+        jenis = 'mutasi' if per_item else 'summary'
+        if parameter.get('zip'):
+            mentah = json.dumps(isi, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+            padat = base64.b64encode(gzip.compress(mentah, IV_ZIP_LEVEL)).decode('ascii')
+            logger.info(
+                'iv %s %s lokasi=%s mode=%s %s s/d %s zip %d -> %d byte (%.2fs)',
+                jenis, len(lokasi), ','.join(lokasi[:5]), mode, dari, sampai, len(mentah), len(padat), time.time() - mulai
+            )
+            return jsonify({'success': True, 'z': padat})
         logger.info(
             'iv %s %s lokasi=%s mode=%s %s s/d %s (%.2fs)',
-            'mutasi' if per_item else 'summary', len(lokasi), ','.join(lokasi[:5]), mode, dari, sampai, time.time() - mulai
+            jenis, len(lokasi), ','.join(lokasi[:5]), mode, dari, sampai, time.time() - mulai
         )
         return jsonify(isi)
     except Exception:
