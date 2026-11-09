@@ -66,6 +66,10 @@ DDL = [
     'nilai_masuk DECIMAL(24,4) NOT NULL, '
     'qty_keluar DECIMAL(24,5) NOT NULL, '
     'nilai_keluar DECIMAL(24,4) NOT NULL, '
+    'nilai_masuk_actual DECIMAL(24,4) NULL, '
+    'nilai_masuk_expected DECIMAL(24,4) NULL, '
+    'nilai_keluar_actual DECIMAL(24,4) NULL, '
+    'nilai_keluar_expected DECIMAL(24,4) NULL, '
     'PRIMARY KEY (location_code, bulan, item_no), '
     'KEY idx_iv_mutasi_bulan (bulan)'
     ') ENGINE=InnoDB',
@@ -75,6 +79,8 @@ DDL = [
     'item_no VARCHAR(30) NOT NULL, '
     'qty DECIMAL(24,5) NOT NULL, '
     'nilai DECIMAL(24,4) NOT NULL, '
+    'nilai_actual DECIMAL(24,4) NULL, '
+    'nilai_expected DECIMAL(24,4) NULL, '
     'PRIMARY KEY (tahun, location_code, item_no)'
     ') ENGINE=InnoDB',
     'CREATE TABLE IF NOT EXISTS iv_tahun_status ('
@@ -97,6 +103,7 @@ DDL = [
     'baris INT NOT NULL, '
     'job_id VARCHAR(36) NULL, '
     'synced_at DATETIME NOT NULL, '
+    'versi TINYINT NOT NULL DEFAULT 1, '
     'PRIMARY KEY (bulan)'
     ') ENGINE=InnoDB',
     'CREATE TABLE IF NOT EXISTS iv_jobs ('
@@ -120,8 +127,17 @@ DDL = [
 TABEL_LAMA = ['iv_daily', 'iv_closing']
 
 KOLOM_BARU = [
-    ('iv_item', 'posting_group', 'VARCHAR(20) NULL AFTER uom')
+    ('iv_item', 'posting_group', 'VARCHAR(20) NULL AFTER uom'),
+    ('iv_mutasi_bulanan', 'nilai_masuk_actual', 'DECIMAL(24,4) NULL'),
+    ('iv_mutasi_bulanan', 'nilai_masuk_expected', 'DECIMAL(24,4) NULL'),
+    ('iv_mutasi_bulanan', 'nilai_keluar_actual', 'DECIMAL(24,4) NULL'),
+    ('iv_mutasi_bulanan', 'nilai_keluar_expected', 'DECIMAL(24,4) NULL'),
+    ('iv_saldo_tahunan', 'nilai_actual', 'DECIMAL(24,4) NULL'),
+    ('iv_saldo_tahunan', 'nilai_expected', 'DECIMAL(24,4) NULL'),
+    ('iv_bulan', 'versi', 'TINYINT NOT NULL DEFAULT 1')
 ]
+
+IV_VERSI_DATA = 2
 
 TINGKAT_LOKASI = 'lokasi'
 TINGKAT_ITEM = 'item'
@@ -392,18 +408,24 @@ def agregasi_bulan(klien, bulan):
             if not lokasi or not item:
                 continue
             qty = Decimal(r.get('Quantity') or 0)
-            nilai = Decimal(r.get('Cost_Amount_Actual') or 0) + Decimal(r.get('Cost_Amount_Expected') or 0)
+            actual = Decimal(r.get('Cost_Amount_Actual') or 0)
+            expected = Decimal(r.get('Cost_Amount_Expected') or 0)
+            nilai = actual + expected
             kunci = (lokasi[:20], item[:30])
             catatan = hasil.get(kunci)
             if catatan is None:
-                catatan = [nol, nol, nol, nol]
+                catatan = [nol, nol, nol, nol, nol, nol, nol, nol]
                 hasil[kunci] = catatan
             if qty > 0 or (qty == 0 and nilai >= 0):
                 catatan[0] += qty
                 catatan[1] += nilai
+                catatan[4] += actual
+                catatan[5] += expected
             else:
                 catatan[2] += qty
                 catatan[3] += nilai
+                catatan[6] += actual
+                catatan[7] += expected
             entri += 1
         del baris
     return hasil, entri
@@ -414,15 +436,16 @@ def simpan_bulan(connection, bulan, hasil, entri, job_id):
     try:
         cursor.execute('DELETE FROM iv_mutasi_bulanan WHERE bulan = %s', (bulan,))
         sql = (
-            'INSERT INTO iv_mutasi_bulanan (location_code, bulan, item_no, qty_masuk, nilai_masuk, qty_keluar, nilai_keluar) '
-            'VALUES (%s, %s, %s, %s, %s, %s, %s)'
+            'INSERT INTO iv_mutasi_bulanan (location_code, bulan, item_no, qty_masuk, nilai_masuk, qty_keluar, nilai_keluar, '
+            'nilai_masuk_actual, nilai_masuk_expected, nilai_keluar_actual, nilai_keluar_expected) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'
         )
-        baris = [(k[0], bulan, k[1], v[0], v[1], v[2], v[3]) for k, v in hasil.items() if not kosong(v)]
+        baris = [(k[0], bulan, k[1], *v) for k, v in hasil.items() if not kosong(v[:4])]
         for awal in range(0, len(baris), IV_INSERT_BATCH):
             cursor.executemany(sql, baris[awal:awal + IV_INSERT_BATCH])
         cursor.execute(
-            'REPLACE INTO iv_bulan (bulan, entri, baris, job_id, synced_at) VALUES (%s, %s, %s, %s, %s)',
-            (bulan, entri, len(baris), job_id, sekarang_wib())
+            'REPLACE INTO iv_bulan (bulan, entri, baris, job_id, synced_at, versi) VALUES (%s, %s, %s, %s, %s, %s)',
+            (bulan, entri, len(baris), job_id, sekarang_wib(), IV_VERSI_DATA)
         )
         cursor.execute(
             'INSERT INTO iv_tahun_status (tahun, kotor, updated_at) VALUES (%s, 1, %s) '
@@ -453,11 +476,15 @@ def bangun_saldo_tahunan(connection):
             mulai = time.time()
             cursor.execute('DELETE FROM iv_saldo_tahunan WHERE tahun = %s', (tahun,))
             cursor.execute(
-                'INSERT INTO iv_saldo_tahunan (tahun, location_code, item_no, qty, nilai) '
-                'SELECT %s, t.location_code, t.item_no, SUM(t.qty), SUM(t.nilai) FROM ('
-                'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan WHERE tahun = %s '
+                'INSERT INTO iv_saldo_tahunan (tahun, location_code, item_no, qty, nilai, nilai_actual, nilai_expected) '
+                'SELECT %s, t.location_code, t.item_no, SUM(t.qty), SUM(t.nilai), '
+                'CASE WHEN COUNT(t.actual) = COUNT(*) THEN SUM(t.actual) END, '
+                'CASE WHEN COUNT(t.expected) = COUNT(*) THEN SUM(t.expected) END FROM ('
+                'SELECT location_code, item_no, qty, nilai, nilai_actual AS actual, nilai_expected AS expected '
+                'FROM iv_saldo_tahunan WHERE tahun = %s '
                 'UNION ALL '
-                'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar '
+                'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar, '
+                'nilai_masuk_actual + nilai_keluar_actual, nilai_masuk_expected + nilai_keluar_expected '
                 'FROM iv_mutasi_bulanan WHERE bulan >= %s AND bulan < %s'
                 ') t GROUP BY t.location_code, t.item_no '
                 'HAVING ABS(SUM(t.qty)) > 0.000001 OR ABS(SUM(t.nilai)) > 0.005',
@@ -482,7 +509,7 @@ def bangun_saldo_tahunan(connection):
 
 def bulan_tersinkron(connection):
     cursor = connection.cursor()
-    cursor.execute('SELECT bulan FROM iv_bulan')
+    cursor.execute('SELECT bulan FROM iv_bulan WHERE versi >= %s', (IV_VERSI_DATA,))
     hasil = {baris[0] for baris in cursor.fetchall()}
     cursor.close()
     return hasil
@@ -498,6 +525,7 @@ def tentukan_bulan(connection, mode, sejak):
         sudah = bulan_tersinkron(connection)
         for bulan in daftar_bulan(mulai_data, awal):
             if bulan not in sudah:
+                logger.info('iv bulan %s belum tersinkron versi %s, sinkron mulai dari bulan ini', bulan, IV_VERSI_DATA)
                 awal = bulan
                 break
     return daftar_bulan(awal, bulan_ini)
