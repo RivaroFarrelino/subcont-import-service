@@ -649,25 +649,36 @@ def per_grup(sql, jumlah_nilai):
     )
 
 
-def saldo_sebelum(cursor, lokasi, bulan, tingkat):
+def jumlah_lengkap(kolom, alias):
+    return f'CASE WHEN COUNT({kolom}) = COUNT(*) THEN SUM({kolom}) END AS {alias}'
+
+
+def saldo_sebelum(cursor, lokasi, bulan, tingkat, pisah=False):
     tanda = ', '.join(['%s'] * len(lokasi))
     kolom = kolom_tingkat(tingkat)
     saring, pola = saring_item()
     if snapshot_dipakai(cursor, bulan.year - 1):
+        tambah_luar = f", {jumlah_lengkap('a', 'v2')}, {jumlah_lengkap('e', 'v3')}" if pisah else ''
+        tambah_tahun = ', nilai_actual AS a, nilai_expected AS e' if pisah else ''
+        tambah_bulan = ', nilai_masuk_actual + nilai_keluar_actual, nilai_masuk_expected + nilai_keluar_expected' if pisah else ''
         sql = (
-            f'SELECT {kolom}, SUM(qty) AS v0, SUM(nilai) AS v1 FROM ('
-            f'SELECT location_code, item_no, qty, nilai FROM iv_saldo_tahunan '
+            f'SELECT {kolom}, SUM(qty) AS v0, SUM(nilai) AS v1{tambah_luar} FROM ('
+            f'SELECT location_code, item_no, qty, nilai{tambah_tahun} FROM iv_saldo_tahunan '
             f'WHERE tahun = %s AND location_code IN ({tanda}){saring} '
             f'UNION ALL '
-            f'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar '
+            f'SELECT location_code, item_no, qty_masuk + qty_keluar, nilai_masuk + nilai_keluar{tambah_bulan} '
             f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan >= %s AND bulan < %s{saring}'
             f') t GROUP BY {kolom}'
         )
         argumen = (bulan.year - 1, *lokasi, *pola, *lokasi, date(bulan.year, 1, 1), bulan, *pola)
     else:
         logger.info('iv saldo %s dihitung tanpa snapshot tahunan', bulan)
+        tambah = (
+            f", {jumlah_lengkap('nilai_masuk_actual + nilai_keluar_actual', 'v2')}"
+            f", {jumlah_lengkap('nilai_masuk_expected + nilai_keluar_expected', 'v3')}"
+        ) if pisah else ''
         sql = (
-            f'SELECT {kolom}, SUM(qty_masuk + qty_keluar) AS v0, SUM(nilai_masuk + nilai_keluar) AS v1 '
+            f'SELECT {kolom}, SUM(qty_masuk + qty_keluar) AS v0, SUM(nilai_masuk + nilai_keluar) AS v1{tambah} '
             f'FROM iv_mutasi_bulanan WHERE location_code IN ({tanda}) AND bulan < %s{saring} GROUP BY {kolom}'
         )
         argumen = (*lokasi, bulan, *pola)
@@ -701,7 +712,19 @@ def kosong(baris):
     return True
 
 
+def angka_kosong(nilai):
+    return None if nilai is None else angka(nilai, 2)
+
+
 def hitung_laporan(cursor, lokasi, mode, dari, sampai, tingkat):
+    pisah = mode == 'asof' and tingkat == TINGKAT_LOKASI
+    if pisah:
+        hasil = {}
+        for kode, qty, nilai, actual, expected in saldo_sebelum(cursor, lokasi, geser_bulan(sampai, 1), tingkat, True):
+            if kosong([qty, nilai]):
+                continue
+            hasil[kode] = [angka(qty, 5), angka(nilai, 2), angka_kosong(actual), angka_kosong(expected)]
+        return hasil
     lebar = 2 if mode == 'asof' else 6
     data = {}
 
