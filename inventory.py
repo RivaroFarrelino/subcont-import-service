@@ -902,6 +902,84 @@ def iv_posting():
     return respons_laporan(TINGKAT_GRUP)
 
 
+def data_dashboard(cursor, lokasi, dari, sampai):
+    tanda = ', '.join(['%s'] * len(lokasi))
+    saring, pola = saring_item()
+    akhir = hitung_laporan(cursor, lokasi, 'asof', None, sampai, TINGKAT_LOKASI)
+    per_lokasi = {kode: nilai + [0, 0, 0, 0] for kode, nilai in akhir.items()}
+    for kode, mq, mn, kq, kn in mutasi_periode(cursor, lokasi, dari, sampai, TINGKAT_LOKASI):
+        gerak = [angka(mq, 5), angka(mn, 2), angka(kq, 5), angka(kn, 2)]
+        if kosong(gerak):
+            continue
+        per_lokasi.setdefault(kode, [0, 0, 0, 0])
+        per_lokasi[kode] = per_lokasi[kode][:4] + gerak
+    awal_q = Decimal(0)
+    awal_n = Decimal(0)
+    for _, qty, nilai in saldo_sebelum(cursor, lokasi, dari, TINGKAT_LOKASI):
+        awal_q += qty
+        awal_n += nilai
+    cursor.execute(
+        f'SELECT bulan, SUM(qty_masuk), SUM(nilai_masuk), SUM(qty_keluar), SUM(nilai_keluar) FROM iv_mutasi_bulanan '
+        f'WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s{saring} GROUP BY bulan ORDER BY bulan',
+        (*lokasi, dari, sampai, *pola)
+    )
+    bulanan = {b.isoformat()[:7]: [angka(mq, 5), angka(mn, 2), angka(kq, 5), angka(kn, 2)] for b, mq, mn, kq, kn in cursor.fetchall()}
+    cursor.execute(
+        f'SELECT entry_type, SUM(qty), SUM(nilai) FROM iv_mutasi_tipe '
+        f'WHERE location_code IN ({tanda}) AND bulan BETWEEN %s AND %s GROUP BY entry_type',
+        (*lokasi, dari, sampai)
+    )
+    tipe = [[jenis, angka(qty, 5), angka(nilai, 2)] for jenis, qty, nilai in cursor.fetchall() if not kosong([qty, nilai])]
+    return {
+        'saldoAwal': [angka(awal_q, 5), angka(awal_n, 2)],
+        'bulan': [[b.isoformat()[:7], *bulanan.get(b.isoformat()[:7], [0, 0, 0, 0])] for b in daftar_bulan(dari, sampai)],
+        'lokasi': per_lokasi,
+        'tipe': tipe,
+        'grup': hitung_laporan(cursor, lokasi, 'asof', None, sampai, TINGKAT_GRUP)
+    }
+
+
+@iv_bp.route('/dashboard', methods=['POST'])
+@butuh_token
+def iv_dashboard():
+    mulai = time.time()
+    parameter = request.get_json(silent=True) or {}
+    try:
+        lokasi = validasi_lokasi(parameter.get('lokasi'))
+        mode, dari, sampai = baca_periode(parameter)
+        if mode != 'range':
+            raise GalatInput('Dashboard memakai periode bulan dari dan sampai')
+    except GalatInput as error:
+        return jsonify({'success': False, 'message': str(error)}), 400
+    connection = connect()
+    cursor = connection.cursor()
+    try:
+        isi = {
+            'success': True,
+            'mode': mode,
+            'dari': dari.isoformat(),
+            'sampai': akhir_bulan(sampai).isoformat(),
+            'bulanDari': dari.isoformat()[:7],
+            'bulanSampai': sampai.isoformat()[:7],
+            'sinkron': info_sinkron(cursor)
+        }
+        isi.update(data_dashboard(cursor, lokasi, dari, sampai))
+        mentah = json.dumps(isi, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        logger.info(
+            'iv dashboard %s lokasi=%s %s s/d %s %d byte (%.2fs)',
+            len(lokasi), ','.join(lokasi[:5]), dari, sampai, len(mentah), time.time() - mulai
+        )
+        if parameter.get('zip'):
+            return jsonify({'success': True, 'z': base64.b64encode(gzip.compress(mentah, IV_ZIP_LEVEL)).decode('ascii')})
+        return jsonify(isi)
+    except Exception:
+        logger.exception('iv dashboard gagal')
+        return jsonify({'success': False, 'message': 'Data belum bisa ditampilkan, coba lagi sebentar lagi'}), 500
+    finally:
+        cursor.close()
+        connection.close()
+
+
 @iv_bp.route('/tipe', methods=['POST'])
 @butuh_token
 def iv_tipe():
