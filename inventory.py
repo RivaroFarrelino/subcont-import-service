@@ -83,6 +83,15 @@ DDL = [
     'nilai_expected DECIMAL(24,4) NULL, '
     'PRIMARY KEY (tahun, location_code, item_no)'
     ') ENGINE=InnoDB',
+    'CREATE TABLE IF NOT EXISTS iv_mutasi_tipe ('
+    'location_code VARCHAR(20) NOT NULL, '
+    'bulan DATE NOT NULL, '
+    'entry_type VARCHAR(40) NOT NULL, '
+    'qty DECIMAL(24,5) NOT NULL, '
+    'nilai DECIMAL(24,4) NOT NULL, '
+    'PRIMARY KEY (location_code, bulan, entry_type), '
+    'KEY idx_iv_tipe_bulan (bulan)'
+    ') ENGINE=InnoDB',
     'CREATE TABLE IF NOT EXISTS iv_tahun_status ('
     'tahun SMALLINT NOT NULL, '
     'kotor TINYINT NOT NULL, '
@@ -137,11 +146,12 @@ KOLOM_BARU = [
     ('iv_bulan', 'versi', 'TINYINT NOT NULL DEFAULT 1')
 ]
 
-IV_VERSI_DATA = 2
+IV_VERSI_DATA = 3
 
 TINGKAT_LOKASI = 'lokasi'
 TINGKAT_ITEM = 'item'
 TINGKAT_GRUP = 'grup'
+TINGKAT_TIPE = 'tipe'
 
 
 class GalatBC(Exception):
@@ -396,9 +406,11 @@ def sinkron_item(klien, connection):
 def agregasi_bulan(klien, bulan):
     parameter = {
         '$filter': f'Posting_Date ge {bulan.isoformat()} and Posting_Date le {akhir_bulan(bulan).isoformat()}',
-        '$select': 'Entry_No,Location_Code,Item_No,Quantity,Cost_Amount_Actual,Cost_Amount_Expected'
+        '$select': 'Entry_No,Entry_Type,Location_Code,Item_No,Quantity,Cost_Amount_Actual,Cost_Amount_Expected'
     }
     hasil = {}
+    tipe = {}
+    kecuali = [k.upper() for k in IV_KECUALI_ITEM]
     entri = 0
     nol = Decimal(0)
     for baris in klien.halaman(BC_ILE_ENDPOINT, parameter):
@@ -416,7 +428,8 @@ def agregasi_bulan(klien, bulan):
             if catatan is None:
                 catatan = [nol, nol, nol, nol, nol, nol, nol, nol]
                 hasil[kunci] = catatan
-            if qty > 0 or (qty == 0 and nilai >= 0):
+            masuk = qty > 0 or (qty == 0 and nilai >= 0)
+            if masuk:
                 catatan[0] += qty
                 catatan[1] += nilai
                 catatan[4] += actual
@@ -426,12 +439,23 @@ def agregasi_bulan(klien, bulan):
                 catatan[3] += nilai
                 catatan[6] += actual
                 catatan[7] += expected
+            if not any(k in item.upper() for k in kecuali):
+                jenis = (r.get('Entry_Type') or '').strip() or '(Tanpa Entry Type)'
+                if jenis == 'Transfer':
+                    jenis = 'Transfer (+)' if masuk else 'Transfer (-)'
+                kunci_tipe = (lokasi[:20], jenis[:40])
+                total_tipe = tipe.get(kunci_tipe)
+                if total_tipe is None:
+                    total_tipe = [nol, nol]
+                    tipe[kunci_tipe] = total_tipe
+                total_tipe[0] += qty
+                total_tipe[1] += nilai
             entri += 1
         del baris
-    return hasil, entri
+    return hasil, entri, tipe
 
 
-def simpan_bulan(connection, bulan, hasil, entri, job_id):
+def simpan_bulan(connection, bulan, hasil, entri, job_id, tipe=None):
     cursor = connection.cursor()
     try:
         cursor.execute('DELETE FROM iv_mutasi_bulanan WHERE bulan = %s', (bulan,))
@@ -443,6 +467,13 @@ def simpan_bulan(connection, bulan, hasil, entri, job_id):
         baris = [(k[0], bulan, k[1], *v) for k, v in hasil.items() if not kosong(v[:4])]
         for awal in range(0, len(baris), IV_INSERT_BATCH):
             cursor.executemany(sql, baris[awal:awal + IV_INSERT_BATCH])
+        cursor.execute('DELETE FROM iv_mutasi_tipe WHERE bulan = %s', (bulan,))
+        baris_tipe = [(k[0], bulan, k[1], v[0], v[1]) for k, v in (tipe or {}).items() if not kosong(v)]
+        if baris_tipe:
+            cursor.executemany(
+                'INSERT INTO iv_mutasi_tipe (location_code, bulan, entry_type, qty, nilai) VALUES (%s, %s, %s, %s, %s)',
+                baris_tipe
+            )
         cursor.execute(
             'REPLACE INTO iv_bulan (bulan, entri, baris, job_id, synced_at, versi) VALUES (%s, %s, %s, %s, %s, %s)',
             (bulan, entri, len(baris), job_id, sekarang_wib(), IV_VERSI_DATA)
@@ -555,10 +586,10 @@ def jalankan_sync(job_id, bulan_list):
             update_job(job_id, bulan_berjalan=bulan)
             kursor_kunci.execute('SELECT 1')
             kursor_kunci.fetchall()
-            hasil, entri = agregasi_bulan(klien, bulan)
+            hasil, entri, tipe = agregasi_bulan(klien, bulan)
             connection.ping(reconnect=True, attempts=3, delay=5)
-            baris = simpan_bulan(connection, bulan, hasil, entri, job_id)
-            del hasil
+            baris = simpan_bulan(connection, bulan, hasil, entri, job_id, tipe)
+            del hasil, tipe
             total_entri += entri
             update_job(job_id, bulan_selesai=urutan, total_entri=total_entri)
             logger.info(
@@ -712,11 +743,34 @@ def kosong(baris):
     return True
 
 
+def laporan_tipe(cursor, lokasi, mode, dari, sampai):
+    tanda = ', '.join(['%s'] * len(lokasi))
+    if mode == 'asof':
+        syarat, argumen = 'bulan <= %s', (sampai,)
+    else:
+        syarat, argumen = 'bulan BETWEEN %s AND %s', (dari, sampai)
+    cursor.execute(
+        f'SELECT location_code, entry_type, SUM(qty), SUM(nilai) FROM iv_mutasi_tipe '
+        f'WHERE location_code IN ({tanda}) AND {syarat} GROUP BY location_code, entry_type',
+        (*lokasi, *argumen)
+    )
+    hasil = {}
+    for kode, jenis, qty, nilai in cursor.fetchall():
+        if kosong([qty, nilai]):
+            continue
+        hasil.setdefault(kode, []).append([jenis, angka(qty, 5), angka(nilai, 2)])
+    for daftar in hasil.values():
+        daftar.sort(key=lambda r: r[0])
+    return hasil
+
+
 def angka_kosong(nilai):
     return None if nilai is None else angka(nilai, 2)
 
 
 def hitung_laporan(cursor, lokasi, mode, dari, sampai, tingkat):
+    if tingkat == TINGKAT_TIPE:
+        return laporan_tipe(cursor, lokasi, mode, dari, sampai)
     pisah = mode == 'asof' and tingkat == TINGKAT_LOKASI
     if pisah:
         hasil = {}
@@ -808,7 +862,7 @@ def respons_laporan(tingkat):
                 for nomor, deskripsi, uom in cursor.fetchall():
                     items[nomor] = [deskripsi or '', uom or '']
             isi['items'] = items
-        jenis = {TINGKAT_ITEM: 'mutasi', TINGKAT_LOKASI: 'summary', TINGKAT_GRUP: 'posting'}[tingkat]
+        jenis = {TINGKAT_ITEM: 'mutasi', TINGKAT_LOKASI: 'summary', TINGKAT_GRUP: 'posting', TINGKAT_TIPE: 'tipe'}[tingkat]
         if parameter.get('zip'):
             mentah = json.dumps(isi, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
             padat = base64.b64encode(gzip.compress(mentah, IV_ZIP_LEVEL)).decode('ascii')
@@ -846,6 +900,12 @@ def iv_summary():
 @butuh_token
 def iv_posting():
     return respons_laporan(TINGKAT_GRUP)
+
+
+@iv_bp.route('/tipe', methods=['POST'])
+@butuh_token
+def iv_tipe():
+    return respons_laporan(TINGKAT_TIPE)
 
 
 @iv_bp.route('/sync', methods=['POST'])
