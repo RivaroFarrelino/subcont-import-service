@@ -107,8 +107,8 @@ TABLE_CONFIGS = [
     {
         'table': 'report',
         'sources': [
-            {'sheet': 'Report', 'header_row': 2, 'usecols': list(range(38))},
-            {'sheet': 'Monitoring', 'header_row': 2, 'usecols': list(range(38))}
+            {'sheet': 'Report', 'header_row': 2, 'usecols': list(range(38)), 'penanda': ['No FPPP', 'Production Order']},
+            {'sheet': 'Monitoring', 'header_row': 2, 'usecols': list(range(38)), 'penanda': ['No FPPP', 'Production Order']}
         ],
         'columns': [
             'row_id', 'commission_number', 'position_number', 'piece_position', 'upload_date',
@@ -590,6 +590,28 @@ def cari_sheet(excel_file, nama):
     return None
 
 
+HEADER_SCAN_ROWS = 15
+
+
+def normal_header(nilai):
+    return ' '.join(str(nilai).split()).upper() if nilai is not None and not pd.isna(nilai) else ''
+
+
+def cari_baris_header(excel_file, nama, source):
+    penanda = [normal_header(p) for p in source.get('penanda', [])]
+    if not penanda:
+        return source['header_row']
+    atas = pd.read_excel(excel_file, sheet_name=nama, header=None, nrows=HEADER_SCAN_ROWS)
+    for indeks, baris in atas.iterrows():
+        isi = {normal_header(v) for v in baris.tolist()}
+        if all(p in isi for p in penanda):
+            if indeks != source['header_row']:
+                logger.info('sheet %s header terdeteksi di baris %s (default %s)', nama, indeks + 1, source['header_row'] + 1)
+            return indeks
+    logger.warning('sheet %s penanda header %s tidak ketemu di %s baris teratas, pakai baris %s', nama, penanda, HEADER_SCAN_ROWS, source['header_row'] + 1)
+    return source['header_row']
+
+
 def read_sheet(excel_file, source, columns):
     nama = cari_sheet(excel_file, source['sheet'])
     if nama is None:
@@ -597,13 +619,22 @@ def read_sheet(excel_file, source, columns):
         return None
     if nama != source['sheet']:
         logger.info('sheet %s dicocokkan ke %s', source['sheet'], nama)
-    return pd.read_excel(
-        excel_file,
-        sheet_name=nama,
-        header=source['header_row'],
-        usecols=source['usecols'],
-        names=columns
-    )
+
+    header_row = cari_baris_header(excel_file, nama, source)
+    dataframe = pd.read_excel(excel_file, sheet_name=nama, header=header_row)
+    tersedia = dataframe.shape[1]
+    dataframe = dataframe.iloc[:, :len(columns)].copy()
+
+    if tersedia < len(columns):
+        kurang = columns[tersedia:]
+        logger.warning('sheet %s hanya %s kolom dari %s, kolom kosong ditambahkan: %s', nama, tersedia, len(columns), ', '.join(kurang))
+        for kolom in kurang:
+            dataframe[kolom + '__kosong'] = None
+
+    dataframe.columns = columns
+    dataframe = dataframe.dropna(how='all')
+    logger.info('sheet %s dibaca %s baris, header baris %s, kolom file %s', nama, len(dataframe), header_row + 1, tersedia)
+    return dataframe
 
 
 def build_upsert_sql(table, columns):
