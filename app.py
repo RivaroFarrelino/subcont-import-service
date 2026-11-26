@@ -108,7 +108,23 @@ TABLE_CONFIGS = [
         'table': 'report',
         'sources': [
             {'sheet': 'Report', 'header_row': 2, 'usecols': list(range(38)), 'penanda': ['No FPPP', 'Production Order']},
-            {'sheet': 'Monitoring', 'header_row': 2, 'usecols': list(range(38)), 'penanda': ['No FPPP', 'Production Order']}
+            {'sheet': 'Monitoring', 'header_row': 2, 'usecols': list(range(38)), 'penanda': ['No FPPP', 'Production Order']},
+            {
+                'sheet': 'TAMBAHAN', 'header_row': 0, 'penanda': ['Item No', 'Production Order'],
+                'posisi': {'item': 'Item No', 'unit': 'Unit Ke'},
+                'peta': {
+                    'row_id': 'No', 'commission_number': 'Production Order', 'piece_position': 'Unit Ke',
+                    'upload_date': 'Tanggal Upload', 'check_1': 'Cek', 'source_document': 'No Order',
+                    'commission_number_dup': 'Production Order', 'fppp_number': 'No FPPP', 'customer_name': 'Project Name',
+                    'opening': 'Opening', 'position_name': 'Kode Unit', 'color': 'Warna', 'unit_name': 'Deskripsi',
+                    'glass_type': 'Kaca', 'frame_qty': 'Qty Frame', 'daun_qty': 'Qty Daun', 'total_scan': 'Total Scan',
+                    'cut_qty': 'Standard Cutting', 'cutting_qty': 'Qty Cutting', 'cutting_date': 'Tgl Cutting',
+                    'assembly_date': 'Tgl Assembling', 'assembly_user': 'User Assembling', 'assembly_scan_qty': 'Qty Scan Assembling',
+                    'sealant_date': 'Tanggal Instral', 'sealant_user': 'User Sealant', 'sealant_scan_qty': 'Qty Scan Instral',
+                    'packing_date': 'Tanggal Packing', 'packing_user': 'User Packing', 'packing_scan_qty': 'Qty Scan Pack',
+                    'project_code': 'Kode Project', 'check_3': 'PACKING WARNING'
+                }
+            }
         ],
         'columns': [
             'row_id', 'commission_number', 'position_number', 'piece_position', 'upload_date',
@@ -612,7 +628,58 @@ def cari_baris_header(excel_file, nama, source):
     return source['header_row']
 
 
-def read_sheet(excel_file, source, columns):
+TAMBAHAN_POSISI_DASAR = 9000000
+TIPE_ANGKA = {'int', 'bigint', 'smallint', 'mediumint', 'tinyint', 'decimal', 'float', 'double', 'numeric'}
+
+
+def posisi_tambahan(dataframe, kolom_file, posisi, tipe_posisi):
+    item = pd.to_numeric(dataframe[kolom_file[normal_header(posisi['item'])]], errors='coerce')
+    unit = pd.to_numeric(dataframe[kolom_file[normal_header(posisi['unit'])]], errors='coerce').fillna(1) if normal_header(posisi['unit']) in kolom_file else pd.Series(1, index=dataframe.index)
+
+    if tipe_posisi in TIPE_ANGKA:
+        hasil = TAMBAHAN_POSISI_DASAR + item * 1000 + unit
+        return hasil.where(item.notna(), None)
+
+    return [
+        'T' + str(int(i)) + '-' + str(int(u)) if pd.notna(i) else None
+        for i, u in zip(item.tolist(), unit.tolist())
+    ]
+
+
+def susun_dari_peta(dataframe, source, columns, column_types, nama):
+    kolom_file = {}
+    for kolom in dataframe.columns:
+        kunci = normal_header(kolom)
+        if kunci and kunci not in kolom_file:
+            kolom_file[kunci] = kolom
+
+    hasil = pd.DataFrame(index=dataframe.index)
+    hilang = []
+
+    for kolom in columns:
+        sumber = source['peta'].get(kolom)
+        if sumber and normal_header(sumber) in kolom_file:
+            hasil[kolom] = dataframe[kolom_file[normal_header(sumber)]]
+        else:
+            if sumber:
+                hilang.append(sumber)
+            hasil[kolom] = None
+
+    posisi = source.get('posisi')
+    if posisi:
+        if normal_header(posisi['item']) not in kolom_file:
+            raise ValueError('sheet ' + nama + ': kolom ' + posisi['item'] + ' tidak ditemukan')
+        tipe = (column_types or {}).get('position_number', '')
+        hasil['position_number'] = posisi_tambahan(dataframe, kolom_file, posisi, tipe)
+        logger.info('sheet %s position_number dibuat dari %s + %s (tipe kolom %s)', nama, posisi['item'], posisi['unit'], tipe or '-')
+
+    if hilang:
+        logger.warning('sheet %s kolom tidak ditemukan, dikosongkan: %s', nama, ', '.join(hilang))
+
+    return hasil[columns]
+
+
+def read_sheet(excel_file, source, columns, column_types=None):
     nama = cari_sheet(excel_file, source['sheet'])
     if nama is None:
         logger.warning('sheet tidak ada, dilewati: %s', source['sheet'])
@@ -622,6 +689,13 @@ def read_sheet(excel_file, source, columns):
 
     header_row = cari_baris_header(excel_file, nama, source)
     dataframe = pd.read_excel(excel_file, sheet_name=nama, header=header_row)
+
+    if source.get('peta'):
+        dataframe = dataframe.dropna(how='all')
+        hasil = susun_dari_peta(dataframe, source, columns, column_types, nama)
+        logger.info('sheet %s dibaca %s baris lewat peta kolom, header baris %s', nama, len(hasil), header_row + 1)
+        return hasil
+
     tersedia = dataframe.shape[1]
     dataframe = dataframe.iloc[:, :len(columns)].copy()
 
@@ -708,7 +782,7 @@ def run_import(job_id, file_path):
             table_rows = 0
 
             for source in config['sources']:
-                dataframe = read_sheet(excel_file, source, config['columns'])
+                dataframe = read_sheet(excel_file, source, config['columns'], column_types)
                 if dataframe is None:
                     continue
                 rows = upsert_dataframe(
